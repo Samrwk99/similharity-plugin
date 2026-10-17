@@ -625,7 +625,7 @@ class QdrantBackend {
                 const existingDimension = collectionInfo.result?.config?.params?.vectors?.size;
 
                 if (existingDimension && existingDimension !== expectedDimension) {
-                    throw new Error(`[Qdrant] Dimension mismatch in ${mainCollection}: stored=${existingDimension}, incoming=${expectedDimension}. Refusing to delete an existing collection.`);
+                    throw new Error(`[Qdrant] Dimension mismatch in ${mainCollection}: stored=${existingDimension}, incoming=${expectedDimension}. A shared Qdrant dense vector slot cannot contain different dimensions. Use separate-collection mode or a different physical shared collection for the new model; no existing vectors were changed.`);
                 }
             }
         } catch (error) {
@@ -751,10 +751,10 @@ class QdrantBackend {
         try {
             // Check if collection exists
             const collections = await this._request('GET', '/collections');
-            const exists = collections.result?.collections?.some(c => c.name === mainCollection);
-            if (!exists) {
-                return [];
-            }
+            if (!Array.isArray(collections?.result?.collections))
+                throw new Error('Malformed Qdrant collections response; cannot confirm whether the collection exists');
+            const exists = collections.result.collections.some(c => c.name === mainCollection);
+            if (!exists) return [];
 
             // Build filter conditions
             const must = [];
@@ -831,8 +831,8 @@ class QdrantBackend {
             }));
         } catch (error) {
             console.error(`[Qdrant] Query failed for ${mainCollection}:`, error.message);
-            if (filters.content_type) throw error; // Never mistake a failed tenant read for an empty collection.
-            return [];
+            // Failed reads cannot be interpreted as an empty collection, including unscoped reads.
+            throw error;
         }
     }
 
@@ -1206,10 +1206,10 @@ class QdrantBackend {
         try {
             // Check if collection exists
             const collections = await this._request('GET', '/collections');
-            const exists = collections.result?.collections?.some(c => c.name === mainCollection);
-            if (!exists) {
-                return [];
-            }
+            if (!Array.isArray(collections?.result?.collections))
+                throw new Error('Malformed Qdrant collections response; cannot confirm an empty collection');
+            const exists = collections.result.collections.some(c => c.name === mainCollection);
+            if (!exists) return [];
 
             // Build filter conditions
             const must = [];
@@ -1236,6 +1236,7 @@ class QdrantBackend {
             // Scroll through all points
             const items = [];
             let offset = null;
+            const observedOffsets = new Set();
 
             // Scroll batch size. Default 100 (Qdrant's recommendation for large payloads).
             // Export uses 500 (vectors + text fits well under the 16-32 MB/request target,
@@ -1256,22 +1257,53 @@ class QdrantBackend {
 
                 const response = await this._request('POST', `/collections/${mainCollection}/points/scroll`, scrollPayload);
 
-                items.push(...(response.result?.points || []).map(p => ({
+                if (!Array.isArray(response?.result?.points))
+                    throw new Error('Malformed Qdrant scroll response; refusing to report an empty or partial collection');
+                items.push(...response.result.points.map(p => ({
                     hash: p.payload.hash,
                     text: p.payload.text,
                     metadata: p.payload,
                     vector: options.includeVectors ? p.vector : undefined,
                 })));
                 offset = response.result?.next_page_offset;
+                if (offset !== null && offset !== undefined) {
+                    const offsetKey = JSON.stringify(offset);
+                    if (observedOffsets.has(offsetKey)) throw new Error('Qdrant scroll repeated a page offset; refusing partial results');
+                    observedOffsets.add(offsetKey);
+                }
             } while (offset !== null && offset !== undefined);
 
             console.log(">>> [Qdrant] Listed", items.length, "items from", mainCollection);
             return items;
         } catch (error) {
             console.error(`[Qdrant] Failed to list items from ${mainCollection}:`, error.message);
-            if (filters.content_type) throw error; // Never mistake a failed tenant read for an empty collection.
-            return [];
+            // Unscoped reads are just as safety-critical as tenant reads.
+            throw error;
         }
+    }
+
+    /** True Qdrant cursor page, without re-scanning the entire collection.
+     * The caller must preserve opaque next_page_offset, never use numeric slices.
+     * An HTTP/network failure is not a successful empty page.
+     */
+    async listItemsPage(collectionName, filters = {}, {cursor=null,pageSize=200,includeVectors=false} = {}) {
+        if (!this.baseUrl) throw new Error('Qdrant not initialized');
+        const name=this._parseCollectionName(collectionName);
+        const must=[];
+        if(filters.content_type)must.push(tenantFilterCondition(filters));
+        if(filters.type)must.push({key:'type',match:{value:filters.type}});
+        if(filters.sourceId)must.push({key:'sourceId',match:{value:filters.sourceId}});
+        const page={limit:Math.min(1000,Math.max(1,Number(pageSize)||200)),
+            with_payload:true,with_vector:!!includeVectors,
+            filter:this._buildFilterExcludingSentinel(must)};
+        if(cursor!=null)page.offset=cursor;
+        const reply=await this._request('POST',`/collections/${name}/points/scroll`,page);
+        if(!Array.isArray(reply?.result?.points))
+            throw new Error('Malformed Qdrant page: cannot report an empty collection');
+        return {items:reply.result.points.map(p=>({
+            hash:p.payload?.hash,text:p.payload?.text,metadata:p.payload,
+            vector:includeVectors?p.vector:undefined,
+        })),nextCursor:reply.result.next_page_offset??null};
     }
 
     /**
@@ -1289,10 +1321,10 @@ class QdrantBackend {
         try {
             // Check if collection exists
             const collections = await this._request('GET', '/collections');
-            const exists = collections.result?.collections?.some(c => c.name === mainCollection);
-            if (!exists) {
-                return [];
-            }
+            if (!Array.isArray(collections?.result?.collections))
+                throw new Error('Malformed Qdrant collections response; cannot confirm an empty collection');
+            const exists = collections.result.collections.some(c => c.name === mainCollection);
+            if (!exists) return [];
 
             // Build filter conditions
             const must = [];
@@ -1332,15 +1364,17 @@ class QdrantBackend {
 
                 const response = await this._request('POST', `/collections/${mainCollection}/points/scroll`, scrollPayload);
 
-                hashes.push(...(response.result?.points || []).map(p => p.payload.hash));
+                if (!Array.isArray(response?.result?.points))
+                    throw new Error('Malformed Qdrant getSavedHashes response');
+                hashes.push(...response.result.points.map(p => p.payload.hash));
                 offset = response.result?.next_page_offset;
             } while (offset !== null && offset !== undefined);
 
             return hashes;
         } catch (error) {
             console.error(`[Qdrant] Failed to get hashes from ${mainCollection}:`, error.message);
-            if (filters.content_type) throw error; // Never mistake a failed tenant read for an empty collection.
-            return [];
+            // Unscoped reads are just as safety-critical as tenant reads.
+            throw error;
         }
     }
 
@@ -1464,10 +1498,12 @@ class QdrantBackend {
         if (!this.baseUrl) { console.error(`[Qdrant LIFECYCLE] 'Qdrant not initialized' thrown. instanceId=${this._instanceId}, initCount=${this._initCount}, config.url=${this.config?.url}, config.host=${this.config?.host}, config.port=${this.config?.port}, apiKey=${this.apiKey ? '(set)' : '(null)'}`); throw new Error('Qdrant not initialized'); }
         try {
             const collections = await this._request('GET', '/collections');
-            return collections.result?.collections?.map(c => c.name) || [];
+            if (!Array.isArray(collections?.result?.collections))
+                throw new Error('Malformed Qdrant collection inventory response');
+            return collections.result.collections.map(c => c.name);
         } catch (error) {
             console.error(`[Qdrant] getCollections failed:`, error.message);
-            return [];
+            throw error;
         }
     }
 
@@ -1508,7 +1544,9 @@ class QdrantBackend {
                 with_vector: true,
             });
 
-            const points = response.result?.points || [];
+            if (!Array.isArray(response?.result?.points))
+                throw new Error('Malformed Qdrant getItem response');
+            const points = response.result.points;
             if (points.length === 0) {
                 return null;
             }
@@ -1522,7 +1560,7 @@ class QdrantBackend {
             };
         } catch (error) {
             console.error(`[Qdrant] getItem failed:`, error.message);
-            return null;
+            throw error;
         }
     }
 
@@ -1675,18 +1713,7 @@ class QdrantBackend {
             };
         } catch (error) {
             console.error(`[Qdrant] getCollectionStats failed:`, error.message);
-            return {
-                chunkCount: 0,
-                totalCharacters: 0,
-                totalTokens: 0,
-                storageSize: 0,
-                embeddingDimensions: 0,
-                avgChunkSize: 0,
-                messageCount: 0,
-                sources: {},
-                backend: 'qdrant',
-                error: error.message,
-            };
+            throw error;
         }
     }
 
@@ -1736,7 +1763,7 @@ class QdrantBackend {
             return (response.result?.points?.length || 0) > 0;
         } catch (error) {
             console.error(`[Qdrant] chunkExists failed:`, error.message);
-            return false;
+            throw error;
         }
     }
 }

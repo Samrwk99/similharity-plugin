@@ -51,6 +51,10 @@ import path from 'node:path';
 import fs from 'node:fs/promises';
 import sanitize from 'sanitize-filename';
 import { createHash } from 'node:crypto';
+import { createProfileJournal } from './profile-journal.js';
+import { createSettingsRevisionStore } from './settings-revision-store.js';
+import { createCollectionMutationQueue, pluginMutationKey } from './collection-mutation-queue.js';
+import { createSharedOperationStore } from './shared-operation-store.js';
 import vectra from 'vectra';
 import qdrantBackend from './qdrant-backend.js';
 
@@ -157,6 +161,57 @@ function getSearchTextDebugSnippet(searchText, maxWords = 200, maxChars = 1000) 
  */
 export async function init(router) {
     console.log(`[${pluginName}] Initializing v${pluginVersion}...`);
+
+    // P2 #60: serialize overlapping physical-collection mutations from
+    // different tabs/devices connected to this SillyTavern process. This
+    // prevents intra-process HTTP races but is NOT cross-process fencing.
+    const collectionMutationQueue = createCollectionMutationQueue();
+    const sharedOperations = createSharedOperationStore(fs);
+    router.use(async (req, res, next) => {
+        const key = pluginMutationKey(req);
+        if (!key) return next();
+        try {
+            // Shared lease checked before the process-local mutation queue. An
+            // active job rejects writes from every other browser/instance.
+            const releaseRemote = await sharedOperations.beginMutation(req.user?.directories?.vectors,
+                req.get('x-vecthare-operation-id'),req.get('x-vecthare-operation-token'));
+            let releaseLocal;
+            try{releaseLocal=await collectionMutationQueue.acquire(key);}
+            catch(e){await releaseRemote();throw e;}
+            // `close` before HTTP `finish` is *not* evidence that a server-side
+            // Qdrant write stopped; leave the durable in-flight marker for
+            // explicit recovery. Only a completed response releases it.
+            res.once('finish',()=>{releaseLocal();void releaseRemote().catch(e=>console.error('VectHare mutation marker release:',e));});
+            // A disconnected HTTP client is NOT proof the backend handler finished.
+            // Keep the process-local lock and durable in-flight marker until
+            // the server actually completes the response; a stalled handler
+            // deliberately blocks successors rather than permit parallel writes.
+            res.once('close',()=>{if(res.writableFinished)return;console.warn('VectHare mutation client disconnected; backend lock retained pending completion');});
+            next();
+        } catch (error) {
+            if(error.status)return res.status(error.status).json({success:false,error:error.message});
+            next(error);
+        }
+    });
+
+    // P2 #60: process-independent operation status and cooperative cancellation.
+    // These routes are scoped to the authenticated SillyTavern user's vector directory.
+    // Multiple SillyTavern processes must mount the same storage; this protocol
+    // cannot coordinate unrelated remote installations on different filesystems.
+    const operationVectors = req => req.user?.directories?.vectors;
+    const operationResponse = fn => async (req,res) => {
+        try {res.json(await fn(req));}
+        catch(e){res.status(e.status||500).json({error:e.message||'Operation coordinator failed'});}
+    };
+    router.get('/vecthare/operations',operationResponse(req=>sharedOperations.list(operationVectors(req))));
+    router.post('/vecthare/operations/start',operationResponse(req=>sharedOperations.start(operationVectors(req),req.body)));
+    router.post('/vecthare/operations/status',operationResponse(req=>sharedOperations.status(operationVectors(req),req.body?.id,req.body?.token)));
+    router.post('/vecthare/operations/heartbeat',operationResponse(req=>sharedOperations.heartbeat(operationVectors(req),req.body?.id,req.body?.token,req.body)));
+    router.post('/vecthare/operations/cancel',operationResponse(req=>sharedOperations.cancel(operationVectors(req),req.body?.id)));
+    router.post('/vecthare/operations/complete',operationResponse(req=>sharedOperations.complete(operationVectors(req),req.body?.id,req.body?.token,req.body?.phase,req.body?.detail)));
+    router.post('/vecthare/operations/recover',operationResponse(req=>sharedOperations.recover(operationVectors(req),req.body?.id,req.body?.confirmation)));
+    router.post('/vecthare/operations/native-begin',operationResponse(req=>sharedOperations.beginNative(operationVectors(req),req.body?.id,req.body?.token)));
+    router.post('/vecthare/operations/native-end',operationResponse(req=>sharedOperations.endNative(operationVectors(req),req.body?.id,req.body?.token,req.body?.markerId)));
 
     // ========================================================================
     // BACKEND HANDLER - Routes requests to appropriate backend
@@ -395,6 +450,15 @@ export async function init(router) {
                     type: 'qdrant',
 
                     list: async (collectionId, source, model, directories, options = {}) => {
+                        // New cursor callers avoid O(N²) re-scanning across pages.
+                        if (Object.hasOwn(options,'cursor')) {
+                            const page=await qdrantBackend.listItemsPage(collectionId,
+                                options.filters||{}, {cursor:options.cursor,pageSize:options.pageSize||200,
+                                    includeVectors:options.includeVectors||false});
+                            return {items:page.items.map(item=>({...item,index:item.metadata?.messageIndex??item.metadata?.messageId??null})),
+                                cursor:page.nextCursor,hasMore:page.nextCursor!=null,
+                                pageMode:'cursor'};
+                        }
                         const items = await qdrantBackend.listItems(collectionId, options.filters || {}, options);
                         // Return same format as Vectra handler for consistency.
                         // Surface a normalized `index` so the database-browser's "Sort: Message Order"
@@ -548,6 +612,37 @@ export async function init(router) {
         }
     });
 
+    // Independently acknowledged recovery copy of non-secret VectHare settings.
+    // Never share between ST users; require the authenticated user directory.
+    const settingsRevisionStore=createSettingsRevisionStore(fs);
+    router.post('/settings/revision/get',async(req,res)=>{
+        try{
+            const row=await settingsRevisionStore.read(req.user.directories.vectors);
+            res.json({success:true,...row});
+        }catch(error){res.status(error.status||500).json({error:formatError(error)});}
+    });
+    router.post('/settings/revision/previous',async(req,res)=>{
+        try{
+            const row=await settingsRevisionStore.readPrevious(req.user.directories.vectors);
+            res.json({success:true,...row});
+        }catch(error){res.status(error.status||500).json({error:formatError(error)});}
+    });
+    router.post('/settings/revision/commit',async(req,res)=>{
+        try{
+            const {expectedRevision,snapshot}=req.body||{};
+            // Reject supplied credentials even if a caller bypasses the UI.
+            function hasSecret(value){
+                if(!value||typeof value!=='object')return false;
+                return Object.entries(value).some(([k,v])=>
+                    /(?:api[_-]?key|password|credential|secret|authorization|access[_-]?token|auth[_-]?token)/i.test(k) ||
+                    (typeof v==='string' && /^https?:\/\//.test(v) && /[?&](?:api[_-]?key|token|secret|password)=/i.test(v)) || hasSecret(v));
+            }
+            if(hasSecret(snapshot))return res.status(400).json({error:'Secrets are not allowed in VectHare settings recovery snapshots'});
+            const result=await settingsRevisionStore.commit(req.user.directories.vectors,expectedRevision,snapshot);
+            res.json({success:true,...result});
+        }catch(error){res.status(error.status||500).json({error:formatError(error)});}
+    });
+
     /** VectHare collection-specific vectorization profile and chunk manifest.
      * Stored in SillyTavern user data, not in the plugin's source directory.
      * The full backend/source/collection identity is hashed to prevent
@@ -558,31 +653,96 @@ export async function init(router) {
         const digest = createHash('sha256').update(key).digest('hex');
         return path.join(req.user.directories.vectors, 'vecthare-profiles', `${digest}.json`);
     };
+    // Serialize profile writes per physical sidecar file. Without this lock two
+    // simultaneous manifest patches can both read the same revision and the
+    // last rename can silently discard one operation's successful vectors.
+    const profileFileLocks=new Map();
+    async function withProfileWriteLock(target,action) {
+        const previous=profileFileLocks.get(target)||Promise.resolve();
+        let unlock;
+        const current=new Promise(resolve=>{unlock=resolve;});
+        profileFileLocks.set(target,current);
+        await previous;
+        const lock=`${target}.write-lock`;
+        let acquired=false;
+        try{
+            await fs.mkdir(path.dirname(target),{recursive:true});
+            try{await fs.mkdir(lock);acquired=true;}
+            catch(error){
+                if(error.code==='EEXIST')throw Object.assign(new Error('Collection sidecar is being changed by another server process; retry or reconcile the previous interrupted write'),{status:409});
+                throw error;
+            }
+            return await action();
+        }finally {
+            if(acquired)await fs.rm(lock,{recursive:true,force:true});
+            unlock();if(profileFileLocks.get(target)===current)profileFileLocks.delete(target);
+        }
+    }
+    async function writeProfileAtomically(target,contents) {
+        if(Buffer.byteLength(contents)>128*1024*1024) {
+            const err=new Error('Collection profile/manifest exceeds 128 MB snapshot safety limit; archive or partition before further writes');
+            err.status=413;throw err;
+        }
+        await fs.mkdir(path.dirname(target),{recursive:true});
+        const staging=`${target}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
+        try {
+            const fd=await fs.open(staging,'wx',0o600);
+            try{await fd.writeFile(contents);await fd.sync();}finally{await fd.close();}
+            await fs.rename(staging,target);
+            const dir=await fs.open(path.dirname(target),'r');
+            try{await dir.sync();}finally{await dir.close();}
+        } finally {await fs.rm(staging,{force:true}).catch(()=>{});}
+    }
+    const profileJournal=createProfileJournal(fs,writeProfileAtomically);
     router.post('/collection/profile/get', async(req,res) => {
         try {
             const file=profilePath(req,req.body?.key);
-            const data=JSON.parse(await fs.readFile(file,'utf8'));
-            if(data.key !== req.body.key) throw new Error('Profile identity does not match requested collection');
-            res.json({success:true,profile:data.profile || null,manifest:data.manifest || null});
+            // Reads share the sidecar lock so a checkpoint / replay cannot race
+            // an in-flight append or profile replacement.
+            const record=await withProfileWriteLock(file,()=>profileJournal.load(file));
+            if(record.state.key!==req.body.key)throw new Error('Profile identity does not match requested collection');
+            res.json({success:true,profile:record.state.profile||null,manifest:record.state.manifest||null});
         } catch(error) {
             if(error.code==='ENOENT')return res.status(404).json({error:'No saved collection profile'});
-            res.status(500).json({error:formatError(error)});
+            res.status(error.status||500).json({error:formatError(error)});
         }
     });
     router.post('/collection/profile/set', async(req,res) => {
         const {key,profile,manifest} = req.body || {};
         try {
-            if(!profile || profile.schemaVersion !== 1) return res.status(400).json({error:'A versioned collection profile is required'});
-            if(manifest != null && (manifest.schemaVersion !== 1 || !Array.isArray(manifest.entries))) return res.status(400).json({error:'Invalid chunk manifest'});
+            if(!profile || profile.schemaVersion !== 1)
+                return res.status(400).json({error:'A versioned collection profile is required'});
+            if(manifest != null && (manifest.schemaVersion !== 1 || !Array.isArray(manifest.entries)))
+                return res.status(400).json({error:'Invalid chunk manifest'});
             const target=profilePath(req,key);
-            const raw=JSON.stringify({key,profile,manifest:manifest||null});
-            if(Buffer.byteLength(raw)>15*1024*1024) return res.status(413).json({error:'Manifest too large'});
-            await fs.mkdir(path.dirname(target),{recursive:true});
-            const staging=`${target}.${process.pid}.${Date.now()}.tmp`;
-            try {await fs.writeFile(staging,raw,{flag:'wx'});await fs.rename(staging,target);}
-            finally {await fs.rm(staging,{force:true}).catch(()=>{});}
+            await withProfileWriteLock(target,async()=>{
+                await profileJournal.set(target,{key,profile,manifest:manifest||null});
+            });
             res.json({success:true});
-        } catch(error){res.status(500).json({error:formatError(error)});}
+        } catch(error){res.status(error.status||500).json({error:formatError(error)});}
+    });
+
+    /** Incremental, compare-and-swap chunk manifest updates.
+     * Append + fsync a bounded revision; compact only occasionally. Fail
+     * closed on truncated journals and stale/wrong-chat revisions.
+     */
+    router.post('/collection/profile/manifest/patch', async(req,res) => {
+        try {
+            const {key,upserts=[],removedHashes=[],chatUUID,expectedUpdatedAt,expectedRevision,updatedAt,revision}=req.body||{};
+            if(!Array.isArray(upserts) || !Array.isArray(removedHashes) ||
+               upserts.length>1000 || removedHashes.length>1000 ||
+               upserts.some(row=>row?.hash==null || typeof row.text!=='string') ||
+               removedHashes.some(hash=>typeof hash!=='number'&&typeof hash!=='string') ||
+               !Number.isSafeInteger(revision) || revision<1 || !Number.isSafeInteger(expectedRevision) ||
+               typeof chatUUID!=='string' || !chatUUID || typeof updatedAt!=='string')
+                return res.status(400).json({error:'Invalid manifest patch'});
+            const target=profilePath(req,key);
+            const answer=await withProfileWriteLock(target,()=>profileJournal.patch(target,{
+                key,upserts,removedHashes,chatUUID,expectedUpdatedAt:expectedUpdatedAt??null,
+                expectedRevision,updatedAt,revision
+            }));
+            res.json(answer);
+        } catch(error){res.status(error.code==='ENOENT'?409:(error.status||500)).json({error:formatError(error)});}
     });
 
     /**
@@ -1035,7 +1195,7 @@ async function _getLegacySingleEmbedding(source, text, model, directories, req) 
         case 'vllm': {
             const apiUrl = req.body?.apiUrl || 'http://127.0.0.1:8000';
             const apiKey = req.body?.apiKey || '';
-            if (req.body?.hybridOptions?.eventbaseDebug || req.body?.options?.eventbaseDebug) console.log(`[similharity] DEBUG vllm embed: apiUrl="${apiUrl}", model="${model}", hasKey=${!!apiKey}`);
+            if (req.body?.hybridOptions?.eventbaseDebug || req.body?.options?.eventbaseDebug) console.log(`[similharity] DEBUG vllm embed: apiUrl="[REDACTED]", model="${model}", hasKey=${!!apiKey}`);
             if (!apiKey) {
                 const { getVllmVector } = await import('../../src/vectors/vllm-vectors.js');
                 return await getVllmVector(text, apiUrl, model, directories);
@@ -1109,6 +1269,8 @@ async function _getLegacySingleEmbedding(source, text, model, directories, req) 
                 limit = 0,
                 includeVectors = false,
                 scrollLimit,
+                cursor,
+                pageSize,
                 filters = {}
             } = req.body;
 
@@ -1122,6 +1284,8 @@ async function _getLegacySingleEmbedding(source, text, model, directories, req) 
                 limit,
                 includeVectors,
                 scrollLimit,
+                ...(Object.hasOwn(req.body,'cursor')?{cursor}:{}),
+                pageSize,
                 filters
             });
 
@@ -1670,20 +1834,70 @@ async function _getLegacySingleEmbedding(source, text, model, directories, req) 
     });
 
     /**
-     * POST /api/plugins/similharity/purge-all
-     * Deletes the entire vectors folder
+     * Inventory ONLY VectHare-owned data. This is a read-only preflight; it does
+     * not claim that another extension's vectors are safe to delete.
+     * An unreachable Qdrant server MUST make the preflight fail.
      */
-    router.post('/purge-all', async (req, res) => {
+    router.get('/vecthare/purge-inventory', async (req, res) => {
         try {
             const vectorsPath = req.user.directories.vectors;
-            await fs.rm(vectorsPath, { recursive: true, force: true });
-            await fs.mkdir(vectorsPath, { recursive: true });
-            res.json({ success: true, message: 'All vectors purged' });
-        } catch (error) {
-            console.error(`[${pluginName}] purge-all error:`, error);
-            res.status(500).json({ error: formatError(error) });
+            // Purge inventory cannot use the normal discovery helper: that
+            // helper deliberately suppresses read/permission errors and would
+            // make an inaccessible index look empty.
+            const localIndexes = await findAllIndexes(vectorsPath, '', true);
+            // scanAllSourcesForCollections may swallow backend errors. Insist on
+            // an independent successful Qdrant read before certifying inventory.
+            const qdrantInitialized = !!qdrantBackend.baseUrl;
+            if (qdrantInitialized && !(await qdrantBackend.healthCheck())) {
+                throw new Error('Qdrant is not reachable; no complete purge inventory is available');
+            }
+            // Use a strict, direct read: getCollections() historically converts
+            // HTTP/network failures into [] and is unsafe for purge planning.
+            const qdrantResponse = qdrantInitialized ? await qdrantBackend._request('GET', '/collections') : null;
+            const qdrantCollections = qdrantInitialized ? qdrantResponse?.result?.collections?.map(item=>item.name) : [];
+            if (qdrantInitialized && !Array.isArray(qdrantCollections)) throw new Error('Incomplete Qdrant collection inventory');
+            const targets = [];
+            for (const entry of localIndexes) {
+                if (/^(?:vecthare_|vh:)/.test(entry.collectionId)) {
+                    targets.push({backend:'standard', collectionId:entry.collectionId,
+                        source:entry.source, modelPath:entry.modelPath});
+                }
+            }
+            for (const collectionId of qdrantCollections) {
+                if (collectionId === 'vecthare_multitenancy') {
+                    const items = await qdrantBackend.listItems(collectionId, {}, {scrollLimit:200,strict:true});
+                    const tenants = new Set();
+                    for (const item of items) {
+                        const tenant = item.metadata?.content_type ?? item.content_type;
+                        // Never infer an unknown tenant or delete other tenants.
+                        if (typeof tenant !== 'string') throw new Error('Shared Qdrant collection has points with missing tenant labels; purge refused');
+                        if (/^(?:vecthare_|vh:)/.test(tenant)) tenants.add(tenant);
+                    }
+                    for (const tenant of tenants) targets.push({backend:'qdrant', collectionId:tenant, multitenancy:true});
+                } else if (/^(?:vecthare_|vh:)/.test(collectionId)) {
+                    targets.push({backend:'qdrant', collectionId, multitenancy:false});
+                }
+            }
+            // Expose only a NON-SECRET canonical endpoint identifier. The
+            // extension rejects inventories from a different Qdrant server;
+            // Similharity's Qdrant singleton may be reconfigured elsewhere.
+            let qdrantEndpoint=null;
+            if(qdrantInitialized){
+                const url=new URL(qdrantBackend.baseUrl);
+                qdrantEndpoint=`${url.protocol}//${url.host.toLowerCase()}${url.pathname.replace(/\/+$/, '')}`;
+            }
+            res.json({success:true, qdrantScanned:qdrantInitialized,
+                qdrantInitialized, qdrantEndpoint, targets});
+        } catch(error) {
+            res.status(503).json({success:false,error:formatError(error)});
         }
     });
+
+    /** Legacy destructive endpoint is intentionally disabled: removing the
+     * whole user vectors directory would erase unrelated data while leaving
+     * remote Qdrant data untouched. Use scoped per-collection deletion.
+     */
+    router.post('/purge-all', (_req, res) => res.status(410).json({success:false,error:'Unsafe global purge is disabled. Update VectHare and use scoped purge with an inventory and confirmation.'}));
 
     /**
      * POST /api/plugins/similharity/chunks/stats
@@ -1824,7 +2038,7 @@ async function getEmbeddingForSource(source, text, model, directories, req) {
         case 'vllm': {
             const apiUrl = req.body?.apiUrl || 'http://127.0.0.1:8000';
             const apiKey = req.body?.apiKey || '';
-            if (req.body?.hybridOptions?.eventbaseDebug || req.body?.options?.eventbaseDebug) console.log(`[similharity] DEBUG vllm embed: apiUrl="${apiUrl}", model="${model}", hasKey=${!!apiKey}`);
+            if (req.body?.hybridOptions?.eventbaseDebug || req.body?.options?.eventbaseDebug) console.log(`[similharity] DEBUG vllm embed: apiUrl="[REDACTED]", model="${model}", hasKey=${!!apiKey}`);
             if (!apiKey) {
                 const { getVllmVector } = await import('../../src/vectors/vllm-vectors.js');
                 return await getVllmVector(text, apiUrl, model, directories);
@@ -1987,7 +2201,7 @@ async function scanAllSourcesForCollections(vectorsPath) {
 /**
  * Find all vectra index.json files
  */
-async function findAllIndexes(dir, relativePath = '') {
+async function findAllIndexes(dir, relativePath = '', strict = false) {
     const results = [];
 
     try {
@@ -1998,7 +2212,7 @@ async function findAllIndexes(dir, relativePath = '') {
             const newRelativePath = relativePath ? path.join(relativePath, entry.name) : entry.name;
 
             if (entry.isDirectory()) {
-                const subResults = await findAllIndexes(fullPath, newRelativePath);
+                const subResults = await findAllIndexes(fullPath, newRelativePath, strict);
                 results.push(...subResults);
             } else if (entry.name === 'index.json') {
                 const pathParts = newRelativePath.split(path.sep);
@@ -2014,6 +2228,7 @@ async function findAllIndexes(dir, relativePath = '') {
             }
         }
     } catch (e) {
+        if (strict && !(relativePath === '' && e.code === 'ENOENT')) throw e;
         // Directory may not exist or not be readable - log at debug level since this is recursive
         if (relativePath === '') {
             console.warn(`[${pluginName}] Vectra: Failed to scan vectors directory:`, e.message);
