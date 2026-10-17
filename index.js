@@ -1,3 +1,4 @@
+import {openAIEmbeddings, strictOllamaEmbedding, providerCapabilities, providerRoute} from './embedding-providers.js';
 /**
  * Similharity Server Plugin
  *
@@ -589,39 +590,95 @@ export async function init(router) {
      * Do not substitute a default localhost server: this must describe the server
      * which will actually generate vectors. No sensitive URLs are persisted.
      */
+    // Provider-aware limits. An advertised context size is not a guarantee
+    // that the current embedding API accepts one input of that length.
     router.post('/embedding/capabilities', async (req, res) => {
-        const {source, apiUrl} = req.body || {};
-        if (source !== 'llamacpp' || !apiUrl) return res.status(400).json({error:'llama.cpp endpoint required'});
+        const {source, apiUrl, model} = req.body || {};
+        if (['vllm','koboldcpp','bananabread','openrouter','electronhub','nanogpt','custom'].includes(source)) {
+            try { return res.json(await providerCapabilities(source,apiUrl,model,req.body?.apiKey)); }
+            catch(error) { return res.status(502).json({error:formatError(error)}); }
+        }
+        if (!['llamacpp','ollama'].includes(source) || !apiUrl)
+            return res.status(400).json({error:'A supported embedding source and explicit endpoint are required'});
         try {
             const base = new URL(apiUrl);
             if (!['http:', 'https:'].includes(base.protocol)) throw new Error('Invalid embedding URL protocol');
-            const request = async (route) => {
-                const url = new URL(route, base);
-                const response = await fetch(url, {signal:AbortSignal.timeout(7000)});
-                if (!response.ok) throw new Error(`${route}: HTTP ${response.status}`);
+            const request = async (route, body=null) => {
+                const response=await fetch(new URL(route,base),{
+                    ...(body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{}),
+                    signal:AbortSignal.timeout(7000),
+                });
+                if (!response.ok)throw new Error(`${route}: HTTP ${response.status}`);
                 return response.json();
             };
-            const models = await request('/v1/models');
-            const entries = models?.data || [];
-            if (entries.length !== 1 || !entries[0]?.id) return res.json({success:true,modelId:null,reason:'Multiple or no loaded models; cannot select embedding model reliably'});
-            const props = await request('/props').catch(() => ({}));
-            const physical = props.n_ubatch ?? props.default_generation_settings?.n_ubatch;
-            const limitEntries = Number.isInteger(physical) && physical > 0 ? [physical,props.n_ctx,props.default_generation_settings?.n_ctx].filter(v=>Number.isInteger(v)&&v>0) : [];
-            res.json({success:true,modelId:entries[0].id,modelPath:props.model_path || props.model_alias || null,limits:limitEntries.length?{maxTokens:Math.min(...limitEntries)}:null});
-        } catch (error) { res.status(502).json({error:formatError(error)}); }
+            if(source==='ollama') {
+                if(typeof model!=='string'||!model.trim())return res.json({success:true,modelId:null,reason:'Choose the explicit Ollama embedding model'});
+                const info=await request('/api/show',{model});
+                const tags=await request('/api/tags').catch(()=>({}));
+                const matching=(tags.models||[]).find(row=>row.name===model || row.model===model || (!model.includes(':') && (row.name===`${model}:latest` || row.model===`${model}:latest`)));
+                const values=Object.entries(info.model_info||{}).filter(([k,v])=>k.endsWith('.context_length')&&Number.isInteger(v)&&v>0).map(([,v])=>v);
+                // /api/show reports architectural context, not guaranteed per-request
+                // embedding throughput. Do not present it as a verified splitting cap.
+                return res.json({success:true,modelId:model,modelPath:matching?.digest||info.digest||null,
+                    limits:values.length?{reportedContextTokens:Math.min(...values)}:null,
+                    tokenizer:'optional-api-tokenize'});
+            }
+            const models=await request('/v1/models');
+            const entries=models?.data||[];
+            if(entries.length!==1||!entries[0]?.id)return res.json({success:true,modelId:null,reason:'Multiple or no loaded models; cannot select embedding model reliably'});
+            const props=await request('/props').catch(()=>({}));
+            const physical=props.n_ubatch??props.default_generation_settings?.n_ubatch;
+            const limits=Number.isInteger(physical)&&physical>0?[physical,props.n_ctx,props.default_generation_settings?.n_ctx].filter(v=>Number.isInteger(v)&&v>0):[];
+            res.json({success:true,modelId:entries[0].id,modelPath:props.model_path||props.model_alias||null,
+                limits:limits.length?{maxTokens:Math.min(...limits)}:null});
+        }catch(error){res.status(502).json({error:formatError(error)});}
     });
-    router.post('/embedding/tokenize', async (req, res) => {
-        const {source, apiUrl, text} = req.body || {};
-        if (source !== 'llamacpp' || !apiUrl || typeof text !== 'string') return res.status(400).json({error:'llama.cpp endpoint and text required'});
-        try {
-            const base = new URL(apiUrl);
-            if (!['http:', 'https:'].includes(base.protocol)) throw new Error('Invalid embedding URL protocol');
-            const response = await fetch(new URL('/tokenize',base), {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:text,add_special:true}),signal:AbortSignal.timeout(10000)});
-            if (!response.ok) throw new Error(`Tokenization HTTP ${response.status}`);
-            const data = await response.json();
-            if (!Array.isArray(data.tokens)) throw new Error('Token count unavailable');
+    router.post('/embedding/tokenize', async(req,res)=>{
+        const {source,apiUrl,text,model}=req.body||{};
+        if (typeof text!=='string') return res.status(400).json({error:'Embedding text is required'});
+        if (source === 'koboldcpp' || source === 'bananabread') {
+            // Their generic tokenizer endpoint is not guaranteed to use the
+            // separate embeddings model. Never pass its count as exact.
+            return res.status(422).json({error:`${source}: embedding-model tokenizer identity cannot be verified; configure the embedding token limit and use conservative splitting`});
+        }
+        if (['vllm','custom','nanogpt','openrouter','electronhub'].includes(source)) {
+            try {
+                const isKobold=source==='koboldcpp';
+                const url=isKobold?new URL('/api/extra/tokencount',new URL(apiUrl)):
+                    source==='vllm'?new URL('/tokenize',new URL(apiUrl)):
+                    providerRoute(source,apiUrl,'tokenize');
+                const headers={'Content-Type':'application/json'};
+                if(req.body?.apiKey)headers.Authorization=`Bearer ${req.body.apiKey}`;
+                const result=await fetch(url,{method:'POST',headers,
+                    body:JSON.stringify(isKobold?{prompt:text}:source==='vllm'?{model,prompt:text}:{model,content:text,prompt:text}),signal:AbortSignal.timeout(10000)});
+                if(!result.ok)return res.status(422).json({error:`${source} has no verified exact tokenizer (HTTP ${result.status}); conservative byte-based splitting will be used`});
+                const data=await result.json();
+                const count=Array.isArray(data.tokens)?data.tokens.length:data.value??data.count??data.token_count;
+                if(!Number.isSafeInteger(count)||count<0)return res.status(422).json({error:'Provider returned no verified token count'});
+                return res.json({success:true,count});
+            } catch(error) {return res.status(422).json({error:formatError(error)});}
+        }
+        if(!['llamacpp','ollama'].includes(source)||!apiUrl)
+            return res.status(400).json({error:'Supported provider, endpoint and text are required'});
+        try{
+            const base=new URL(apiUrl);
+            if(!['http:','https:'].includes(base.protocol))throw new Error('Invalid embedding URL protocol');
+            const isOllama=source==='ollama';
+            if(isOllama && !model)return res.status(400).json({error:'Ollama tokenizer requires a model'});
+            const response=await fetch(new URL(isOllama?'/api/tokenize':'/tokenize',base),{
+                method:'POST',headers:{'Content-Type':'application/json'},
+                body:JSON.stringify(isOllama?{model,content:text}:{content:text,add_special:true}),
+                signal:AbortSignal.timeout(10000),
+            });
+            if(!response.ok){
+                if(isOllama && [404,405,501].includes(response.status))
+                    return res.status(422).json({error:'This Ollama server does not expose model-accurate tokenization; automatic splitting is disabled for safety'});
+                throw new Error(`Tokenization HTTP ${response.status}`);
+            }
+            const data=await response.json();
+            if(!Array.isArray(data.tokens))throw new Error('Exact token count unavailable');
             res.json({success:true,count:data.tokens.length});
-        } catch (error) { res.status(502).json({error:formatError(error)}); }
+        }catch(error){res.status(502).json({error:formatError(error)});}
     });
 
     /**
@@ -811,7 +868,12 @@ async function getVectorsForSource(source, texts, model, directories, req) {
     // Local GPU sources (transformers, ollama, llamacpp, koboldcpp) serialize
     // on the model, so parallel JS calls just queue. Default branch below
     // keeps them sequential to avoid OOM.
-    const openaiCompatible = new Set(['openai', 'openrouter', 'togetherai', 'mistral', 'electronhub']);
+    const openaiCompatible = new Set(['openai', 'openrouter', 'togetherai', 'mistral', 'electronhub', 'nanogpt', 'custom']);
+    if (['nanogpt','custom'].includes(source) || (['openrouter','electronhub'].includes(source) && req.body?.apiUrl)) {
+        const results=[];
+        for(let i=0;i<texts.length;i+=64) results.push(...await openAIEmbeddings(source,texts.slice(i,i+64),model,req.body?.apiUrl,req.body?.apiKey));
+        return results;
+    }
     if (openaiCompatible.has(source)) {
         const { getOpenAIBatchVector } = await import('../../src/vectors/openai-vectors.js');
         // ElectronHub requires a model name; mirror the _getLegacySingleEmbedding default
@@ -931,11 +993,18 @@ async function _getLegacySingleEmbedding(source, text, model, directories, req) 
             const { getTransformersVector } = await import('../../src/vectors/embedding.js');
             return await getTransformersVector(text);
         }
+        case 'nanogpt':
+        case 'custom': {
+            return (await openAIEmbeddings(source,[text],model,req.body?.apiUrl,req.body?.apiKey))[0];
+        }
         case 'openai':
         case 'togetherai':
         case 'mistral':
         case 'electronhub':
         case 'openrouter': {
+            if (['openrouter','electronhub'].includes(source) && req.body?.apiUrl) {
+                return (await openAIEmbeddings(source,[text],model,req.body.apiUrl,req.body.apiKey))[0];
+            }
             const { getOpenAIVector } = await import('../../src/vectors/openai-vectors.js');
             // ElectronHub requires a model name, provide default if empty
             const effectiveModel = (source === 'electronhub' && !model) ? 'text-embedding-ada-002' : model;
@@ -953,26 +1022,7 @@ async function _getLegacySingleEmbedding(source, text, model, directories, req) 
             return await _getKoboldCppEmbedding(text, model, req);
         }
         case 'ollama': {
-            const apiUrl = req.body?.apiUrl || 'http://127.0.0.1:11434';
-            const apiKey = req.body?.apiKey || '';
-            const keep = req.body?.keep || false;
-            if (!apiKey) {
-                const { getOllamaVector } = await import('../../src/vectors/ollama-vectors.js');
-                return await getOllamaVector(text, apiUrl, model, keep, directories);
-            }
-            const ollamaUrl = new URL('/api/embeddings', apiUrl.replace(/\/$/, ''));
-            const ollamaResp = await fetch(ollamaUrl, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-                body: JSON.stringify({ model, prompt: text, keep_alive: keep ? -1 : undefined }),
-            });
-            if (!ollamaResp.ok) {
-                const errText = await ollamaResp.text();
-                throw new Error(`Ollama: Failed to get vector: ${ollamaResp.statusText} ${errText}`);
-            }
-            const ollamaData = await ollamaResp.json();
-            if (!Array.isArray(ollamaData?.embedding)) throw new Error('Ollama: API response missing embedding array');
-            return ollamaData.embedding;
+            return strictOllamaEmbedding(text, req.body?.apiUrl || 'http://127.0.0.1:11434', model, !!req.body?.keep, req.body?.apiKey || '');
         }
         case 'llamacpp': {
             const { getLlamaCppVector } = await import('../../src/vectors/llamacpp-vectors.js');
@@ -1732,11 +1782,18 @@ async function getEmbeddingForSource(source, text, model, directories, req) {
             const { getTransformersVector } = await import('../../src/vectors/embedding.js');
             return await getTransformersVector(text);
         }
+        case 'nanogpt':
+        case 'custom': {
+            return (await openAIEmbeddings(source,[text],model,req.body?.apiUrl,req.body?.apiKey))[0];
+        }
         case 'openai':
         case 'togetherai':
         case 'mistral':
         case 'electronhub':
         case 'openrouter': {
+            if (['openrouter','electronhub'].includes(source) && req.body?.apiUrl) {
+                return (await openAIEmbeddings(source,[text],model,req.body.apiUrl,req.body.apiKey))[0];
+            }
             const { getOpenAIVector } = await import('../../src/vectors/openai-vectors.js');
             // ElectronHub requires a model name, provide default if empty
             const effectiveModel = (source === 'electronhub' && !model) ? 'text-embedding-ada-002' : model;
@@ -1754,26 +1811,7 @@ async function getEmbeddingForSource(source, text, model, directories, req) {
             return await getCohereVector(text, true, directories, model);
         }
         case 'ollama': {
-            const apiUrl = req.body?.apiUrl || 'http://127.0.0.1:11434';
-            const apiKey = req.body?.apiKey || '';
-            const keep = req.body?.keep || false;
-            if (!apiKey) {
-                const { getOllamaVector } = await import('../../src/vectors/ollama-vectors.js');
-                return await getOllamaVector(text, apiUrl, model, keep, directories);
-            }
-            const ollamaUrl = new URL('/api/embeddings', apiUrl.replace(/\/$/, ''));
-            const ollamaResp = await fetch(ollamaUrl, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-                body: JSON.stringify({ model, prompt: text, keep_alive: keep ? -1 : undefined }),
-            });
-            if (!ollamaResp.ok) {
-                const errText = await ollamaResp.text();
-                throw new Error(`Ollama: Failed to get vector: ${ollamaResp.statusText} ${errText}`);
-            }
-            const ollamaData = await ollamaResp.json();
-            if (!Array.isArray(ollamaData?.embedding)) throw new Error('Ollama: API response missing embedding array');
-            return ollamaData.embedding;
+            return strictOllamaEmbedding(text, req.body?.apiUrl || 'http://127.0.0.1:11434', model, !!req.body?.keep, req.body?.apiKey || '');
         }
         case 'llamacpp': {
             const { getLlamaCppVector } = await import('../../src/vectors/llamacpp-vectors.js');
