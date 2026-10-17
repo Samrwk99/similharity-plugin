@@ -49,6 +49,7 @@
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import sanitize from 'sanitize-filename';
+import { createHash } from 'node:crypto';
 import vectra from 'vectra';
 import qdrantBackend from './qdrant-backend.js';
 
@@ -544,6 +545,83 @@ export async function init(router) {
             console.error(`[${pluginName}] collections error:`, error);
             res.status(500).json({ error: formatError(error) });
         }
+    });
+
+    /** VectHare collection-specific vectorization profile and chunk manifest.
+     * Stored in SillyTavern user data, not in the plugin's source directory.
+     * The full backend/source/collection identity is hashed to prevent
+     * filename collisions, tenant crossover and path traversal.
+     */
+    const profilePath = (req, key) => {
+        if (!key || typeof key !== 'string' || key.length > 1024) throw new Error('Invalid collection identity');
+        const digest = createHash('sha256').update(key).digest('hex');
+        return path.join(req.user.directories.vectors, 'vecthare-profiles', `${digest}.json`);
+    };
+    router.post('/collection/profile/get', async(req,res) => {
+        try {
+            const file=profilePath(req,req.body?.key);
+            const data=JSON.parse(await fs.readFile(file,'utf8'));
+            if(data.key !== req.body.key) throw new Error('Profile identity does not match requested collection');
+            res.json({success:true,profile:data.profile || null,manifest:data.manifest || null});
+        } catch(error) {
+            if(error.code==='ENOENT')return res.status(404).json({error:'No saved collection profile'});
+            res.status(500).json({error:formatError(error)});
+        }
+    });
+    router.post('/collection/profile/set', async(req,res) => {
+        const {key,profile,manifest} = req.body || {};
+        try {
+            if(!profile || profile.schemaVersion !== 1) return res.status(400).json({error:'A versioned collection profile is required'});
+            if(manifest != null && (manifest.schemaVersion !== 1 || !Array.isArray(manifest.entries))) return res.status(400).json({error:'Invalid chunk manifest'});
+            const target=profilePath(req,key);
+            const raw=JSON.stringify({key,profile,manifest:manifest||null});
+            if(Buffer.byteLength(raw)>15*1024*1024) return res.status(413).json({error:'Manifest too large'});
+            await fs.mkdir(path.dirname(target),{recursive:true});
+            const staging=`${target}.${process.pid}.${Date.now()}.tmp`;
+            try {await fs.writeFile(staging,raw,{flag:'wx'});await fs.rename(staging,target);}
+            finally {await fs.rm(staging,{force:true}).catch(()=>{});}
+            res.json({success:true});
+        } catch(error){res.status(500).json({error:formatError(error)});}
+    });
+
+    /**
+     * Proxy metadata/tokenization from the explicitly configured embedding URL.
+     * Do not substitute a default localhost server: this must describe the server
+     * which will actually generate vectors. No sensitive URLs are persisted.
+     */
+    router.post('/embedding/capabilities', async (req, res) => {
+        const {source, apiUrl} = req.body || {};
+        if (source !== 'llamacpp' || !apiUrl) return res.status(400).json({error:'llama.cpp endpoint required'});
+        try {
+            const base = new URL(apiUrl);
+            if (!['http:', 'https:'].includes(base.protocol)) throw new Error('Invalid embedding URL protocol');
+            const request = async (route) => {
+                const url = new URL(route, base);
+                const response = await fetch(url, {signal:AbortSignal.timeout(7000)});
+                if (!response.ok) throw new Error(`${route}: HTTP ${response.status}`);
+                return response.json();
+            };
+            const models = await request('/v1/models');
+            const entries = models?.data || [];
+            if (entries.length !== 1 || !entries[0]?.id) return res.json({success:true,modelId:null,reason:'Multiple or no loaded models; cannot select embedding model reliably'});
+            const props = await request('/props').catch(() => ({}));
+            const physical = props.n_ubatch ?? props.default_generation_settings?.n_ubatch;
+            const limitEntries = Number.isInteger(physical) && physical > 0 ? [physical,props.n_ctx,props.default_generation_settings?.n_ctx].filter(v=>Number.isInteger(v)&&v>0) : [];
+            res.json({success:true,modelId:entries[0].id,modelPath:props.model_path || props.model_alias || null,limits:limitEntries.length?{maxTokens:Math.min(...limitEntries)}:null});
+        } catch (error) { res.status(502).json({error:formatError(error)}); }
+    });
+    router.post('/embedding/tokenize', async (req, res) => {
+        const {source, apiUrl, text} = req.body || {};
+        if (source !== 'llamacpp' || !apiUrl || typeof text !== 'string') return res.status(400).json({error:'llama.cpp endpoint and text required'});
+        try {
+            const base = new URL(apiUrl);
+            if (!['http:', 'https:'].includes(base.protocol)) throw new Error('Invalid embedding URL protocol');
+            const response = await fetch(new URL('/tokenize',base), {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:text,add_special:true}),signal:AbortSignal.timeout(10000)});
+            if (!response.ok) throw new Error(`Tokenization HTTP ${response.status}`);
+            const data = await response.json();
+            if (!Array.isArray(data.tokens)) throw new Error('Token count unavailable');
+            res.json({success:true,count:data.tokens.length});
+        } catch (error) { res.status(502).json({error:formatError(error)}); }
     });
 
     /**
