@@ -471,7 +471,7 @@ export async function init(router) {
                     },
 
                     delete: async (collectionId, hashes, source, model, directories, filters = {}) => {
-                        await qdrantBackend.deleteVectors(collectionId, hashes);
+                        await qdrantBackend.deleteVectors(collectionId, hashes, filters);
                         return hashes.length;
                     },
 
@@ -956,6 +956,17 @@ async function _getLegacySingleEmbedding(source, text, model, directories, req) 
      * List all chunks in a collection with pagination
      * Body: { backend, collectionId, source?, model?, offset?, limit?, includeVectors?, filters? }
      */
+    // VectHare checks this contract before enabling shared-collection writes.
+    // Do not remove or rename without coordinating a migration.
+    router.get('/qdrant/tenant-capabilities', (_req, res) => {
+        res.json({
+            qdrantTenantIsolation: 1,
+            pointIds: 'sha256-uuid-of-tenant-and-hash',
+            filters: 'content_type',
+            safeOperations: ['insert', 'list', 'query', 'delete', 'purge', 'get', 'update', 'stats'],
+        });
+    });
+
     router.post('/chunks/list', async (req, res) => {
         try {
             const {

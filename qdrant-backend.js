@@ -24,6 +24,8 @@
  * ============================================================================
  */
 
+import { createHash } from 'node:crypto';
+
 // Qdrant on-disk constants. NEVER change these without an upgrade routine —
 // they live inside user Qdrant databases.
 const SENTINEL_POINT_TYPE = '_vectfox_meta';
@@ -34,6 +36,22 @@ const SENTINEL_FLAG_KEY = '_vectfox_sentinel';
 // the upgrade button yet.
 let _legacyDataWarningFired = false;
 const MULTITENANCY_COLLECTION = 'vectfox_main';
+
+/** Stable tenant-scoped Qdrant point IDs (UUID) prevent cross-tenant hash collisions.
+ * Numeric content hashes remain unchanged in point payloads for VectHare deduplication.
+ */
+function tenantPointId(contentType, hash) {
+    if (typeof contentType !== 'string' || !contentType.trim()) throw new Error('Tenant identifier required');
+    const digest = createHash('sha256').update(JSON.stringify([contentType, String(hash)])).digest('hex');
+    return `${digest.slice(0, 8)}-${digest.slice(8, 12)}-5${digest.slice(13, 16)}-a${digest.slice(17, 20)}-${digest.slice(20, 32)}`;
+}
+
+function tenantFilterCondition(filters) {
+    return filters?.content_type
+        ? { key: 'content_type', match: { value: filters.content_type } }
+        : null;
+}
+
 
 /**
  * Qdrant Backend Manager
@@ -423,6 +441,7 @@ class QdrantBackend {
             // TENANT FIELDS (is_tenant: true for optimized multitenancy)
             { field: 'type', schema: { type: 'keyword', is_tenant: true } },
             { field: 'sourceId', schema: { type: 'keyword', is_tenant: true } },
+            { field: 'content_type', schema: { type: 'keyword', is_tenant: true } },
             // REGULAR KEYWORD FIELDS
             { field: 'embeddingSource', schema: 'keyword' },
             { field: 'embeddingModel', schema: 'keyword' },
@@ -606,14 +625,11 @@ class QdrantBackend {
                 const existingDimension = collectionInfo.result?.config?.params?.vectors?.size;
 
                 if (existingDimension && existingDimension !== expectedDimension) {
-                    console.warn(`[Qdrant] Vector dimension mismatch. Collection has ${existingDimension} dimensions, but insert requires ${expectedDimension}. Dropping collection to recreate...`);
-                    await this.purgeAll();
-                    // Wait slightly for deletion to propagate (optional but safe)
-                    await new Promise(resolve => setTimeout(resolve, 500));
+                    throw new Error(`[Qdrant] Dimension mismatch in ${mainCollection}: stored=${existingDimension}, incoming=${expectedDimension}. Refusing to delete an existing collection.`);
                 }
             }
         } catch (error) {
-             console.debug('[Qdrant] Could not check existing collection dimension:', error.message);
+             throw new Error(`[Qdrant] Cannot verify collection dimension safely: ${error.message}`);
         }
 
         // Ensure collection exists (use first vector's size)
@@ -648,7 +664,7 @@ class QdrantBackend {
         // but NOT numeric strings like "977206". JSON parsing from HTTP requests can sometimes
         // convert numbers to strings, so we explicitly coerce here.
         const points = items.map(item => ({
-            id: typeof item.hash === 'string' ? parseInt(item.hash, 10) : item.hash, // Ensure numeric ID for Qdrant
+            id: tenantMetadata.content_type ? tenantPointId(tenantMetadata.content_type, item.hash) : (typeof item.hash === 'string' ? parseInt(item.hash, 10) : item.hash),
             // When the collection has a named sparse vector, Qdrant requires the point's vector
             // field to be an object keyed by vector name. Default dense vector is keyed by "".
             // Without sparse, keep the plain-array form so we don't break existing collections.
@@ -668,6 +684,7 @@ class QdrantBackend {
                 sourceId: tenantMetadata.sourceId || 'unknown',
                 embeddingSource: tenantMetadata.embeddingSource || 'transformers',
                 embeddingModel: tenantMetadata.embeddingModel || '',
+                ...(tenantMetadata.content_type ? { content_type: tenantMetadata.content_type } : {}),
 
                 // ===== TIMESTAMPS (for temporal decay) =====
                 timestamp: item.metadata?.timestamp || Date.now(),
@@ -741,6 +758,7 @@ class QdrantBackend {
 
             // Build filter conditions
             const must = [];
+            if (filters.content_type) must.push(tenantFilterCondition(filters));
 
             if (filters.type) {
                 must.push({
@@ -813,6 +831,7 @@ class QdrantBackend {
             }));
         } catch (error) {
             console.error(`[Qdrant] Query failed for ${mainCollection}:`, error.message);
+            if (filters.content_type) throw error; // Never mistake a failed tenant read for an empty collection.
             return [];
         }
     }
@@ -1194,6 +1213,7 @@ class QdrantBackend {
 
             // Build filter conditions
             const must = [];
+            if (filters.content_type) must.push(tenantFilterCondition(filters));
             if (filters.type) {
                 must.push({
                     key: 'type',
@@ -1249,6 +1269,7 @@ class QdrantBackend {
             return items;
         } catch (error) {
             console.error(`[Qdrant] Failed to list items from ${mainCollection}:`, error.message);
+            if (filters.content_type) throw error; // Never mistake a failed tenant read for an empty collection.
             return [];
         }
     }
@@ -1275,6 +1296,7 @@ class QdrantBackend {
 
             // Build filter conditions
             const must = [];
+            if (filters.content_type) must.push(tenantFilterCondition(filters));
             if (filters.type) {
                 must.push({
                     key: 'type',
@@ -1317,6 +1339,7 @@ class QdrantBackend {
             return hashes;
         } catch (error) {
             console.error(`[Qdrant] Failed to get hashes from ${mainCollection}:`, error.message);
+            if (filters.content_type) throw error; // Never mistake a failed tenant read for an empty collection.
             return [];
         }
     }
@@ -1327,39 +1350,28 @@ class QdrantBackend {
      * @param {number[]} hashes - Hashes to delete
      * @returns {Promise<void>}
      */
-    async deleteVectors(collectionName, hashes) {
-        if (!this.baseUrl) { console.error(`[Qdrant LIFECYCLE] 'Qdrant not initialized' thrown. instanceId=${this._instanceId}, initCount=${this._initCount}, config.url=${this.config?.url}, config.host=${this.config?.host}, config.port=${this.config?.port}, apiKey=${this.apiKey ? '(set)' : '(null)'}`); throw new Error('Qdrant not initialized'); }
-        if (hashes.length === 0) return;
-
+    async deleteVectors(collectionName, hashes, filters = {}) {
+        if (!this.baseUrl) throw new Error('Qdrant not initialized');
+        if (!Array.isArray(hashes) || hashes.length === 0) return;
         collectionName = this._parseCollectionName(collectionName);
-        const mainCollection = collectionName;
-
-        // Validate: Qdrant point IDs must be uint or UUID string. Drop null/undefined/NaN
-        // hashes before sending; surface them as an error so the client knows the delete
-        // never reached Qdrant for those items (previously: 400 from Qdrant + silent catch).
-        const numericHashes = [];
-        const invalidHashes = [];
-        for (const h of hashes) {
-            const n = typeof h === 'string' ? parseInt(h, 10) : h;
-            if (typeof n === 'number' && Number.isFinite(n) && n >= 0) {
-                numericHashes.push(n);
-            } else {
-                invalidHashes.push(h);
-            }
+        const numericHashes = hashes.map(h => Number(h));
+        if (numericHashes.some(h => !Number.isSafeInteger(h) || h < 0)) {
+            throw new Error('[Qdrant] Refusing deletion with invalid chunk hashes');
         }
-        if (invalidHashes.length > 0) {
-            throw new Error(`[Qdrant] Cannot delete: ${invalidHashes.length} item(s) have invalid hashes (${JSON.stringify(invalidHashes.slice(0, 3))}). These items likely have no \`hash\` payload field — e.g. the VectFox sentinel point. Listing now filters the sentinel out, so this should not happen for normal chunks.`);
+        if (filters.content_type) {
+            // Payload filters match both legacy numeric and new tenant-scoped UUID points,
+            // while preventing deletion of another tenant with an identical chunk hash.
+            await this._request('POST', `/collections/${collectionName}/points/delete?wait=true`, {
+                filter: { must: [
+                    tenantFilterCondition(filters),
+                    { key: 'hash', match: { any: numericHashes } },
+                ] },
+            });
+        } else {
+            await this._request('POST', `/collections/${collectionName}/points/delete?wait=true`, {
+                points: numericHashes,
+            });
         }
-        if (numericHashes.length === 0) {
-            throw new Error(`[Qdrant] Cannot delete: all ${hashes.length} hash(es) were invalid.`);
-        }
-
-        // Throw on failure so the route returns 500 and the client UI sees the error.
-        await this._request('POST', `/collections/${mainCollection}/points/delete?wait=true`, {
-            points: numericHashes,
-        });
-
-        console.log(`[Qdrant] Deleted ${numericHashes.length} items from ${mainCollection}`);
     }
 
     /**
@@ -1398,6 +1410,7 @@ class QdrantBackend {
                 });
             }
 
+            if (filters.content_type) must.push(tenantFilterCondition(filters));
             if (must.length === 0) {
                 console.warn('[Qdrant] No filters provided to purgeCollection - use purgeAll() instead');
                 return;
@@ -1479,6 +1492,7 @@ class QdrantBackend {
             const must = [
                 { key: 'hash', match: { value: numericHash } }
             ];
+            if (filters.content_type) must.push(tenantFilterCondition(filters));
 
             if (filters.type) {
                 must.push({ key: 'type', match: { value: filters.type } });
@@ -1521,30 +1535,28 @@ class QdrantBackend {
      * @returns {Promise<void>}
      */
     async updateItem(collectionName, hash, updates, filters = {}) {
-        if (!this.baseUrl) { console.error(`[Qdrant LIFECYCLE] 'Qdrant not initialized' thrown. instanceId=${this._instanceId}, initCount=${this._initCount}, config.url=${this.config?.url}, config.host=${this.config?.host}, config.port=${this.config?.port}, apiKey=${this.apiKey ? '(set)' : '(null)'}`); throw new Error('Qdrant not initialized'); }
-
-        // Get existing item
+        if (!this.baseUrl) throw new Error('Qdrant not initialized');
         const existing = await this.getItem(collectionName, hash, filters);
-        if (!existing) {
-            throw new Error(`Item with hash ${hash} not found`);
-        }
-
-        // Delete old item
-        await this.deleteVectors(collectionName, [hash]);
-
-        // Merge updates with existing data
-        const newHash = updates.hash || hash;
+        if (!existing) throw new Error(`Item with hash ${hash} not found for specified tenant`);
+        const oldHash = Number(hash);
+        const newHash = updates.hash ?? oldHash;
         const newItem = {
             hash: newHash,
-            text: updates.text || existing.text,
-            vector: updates.vector || existing.vector,
-            metadata: { ...existing.metadata, ...updates },
+            text: updates.text ?? existing.text,
+            vector: updates.vector ?? existing.vector,
+            metadata: { ...existing.metadata, ...updates, ...(filters.content_type ? { content_type: filters.content_type } : {}) },
         };
-
-        // Insert updated item
-        await this.insertVectors(collectionName, [newItem], filters);
-
-        console.log(`[Qdrant] Updated item ${hash} -> ${newHash}`);
+        // Upsert the replacement before deleting the original; never delete on failed insert.
+        await this.insertVectors(collectionName, [newItem], {
+            ...filters,
+            type: existing.metadata?.type,
+            sourceId: existing.metadata?.sourceId,
+            embeddingSource: existing.metadata?.embeddingSource,
+            embeddingModel: existing.metadata?.embeddingModel,
+        });
+        if (String(newHash) !== String(oldHash)) {
+            await this.deleteVectors(collectionName, [oldHash], filters);
+        }
     }
 
     /**
@@ -1556,19 +1568,26 @@ class QdrantBackend {
      * @returns {Promise<void>}
      */
     async updateItemMetadata(collectionName, hash, metadata, filters = {}) {
-        if (!this.baseUrl) { console.error(`[Qdrant LIFECYCLE] 'Qdrant not initialized' thrown. instanceId=${this._instanceId}, initCount=${this._initCount}, config.url=${this.config?.url}, config.host=${this.config?.host}, config.port=${this.config?.port}, apiKey=${this.apiKey ? '(set)' : '(null)'}`); throw new Error('Qdrant not initialized'); }
-
+        if (!this.baseUrl) throw new Error('Qdrant not initialized');
         collectionName = this._parseCollectionName(collectionName);
-        const numericHash = typeof hash === 'string' ? parseInt(hash, 10) : hash;
-
-        // Use Qdrant's native payload-update endpoint — no vector fetch/delete/reinsert needed.
-        // This works correctly for both plain-vector and named-vector (hybrid) collections.
-        await this._request('POST', `/collections/${collectionName}/points/payload?wait=true`, {
-            payload: metadata,
-            points: [numericHash],
-        });
-
-        console.log(`[Qdrant] Updated metadata for item ${hash}`);
+        const numericHash = Number(hash);
+        if (!Number.isSafeInteger(numericHash) || numericHash < 0) throw new Error('Invalid chunk hash');
+        const safeMetadata = { ...metadata };
+        if (filters.content_type) {
+            // Tenant identity is immutable: a metadata edit cannot transfer ownership.
+            for (const key of ['content_type', 'hash', 'type', 'sourceId']) {
+                if (Object.hasOwn(safeMetadata, key)) throw new Error(`Cannot modify protected ${key} metadata`);
+            }
+            await this._request('POST', `/collections/${collectionName}/points/payload?wait=true`, {
+                payload: safeMetadata,
+                filter: { must: [tenantFilterCondition(filters), { key: 'hash', match: { value: numericHash } }] },
+            });
+        } else {
+            await this._request('POST', `/collections/${collectionName}/points/payload?wait=true`, {
+                payload: safeMetadata,
+                points: [numericHash],
+            });
+        }
     }
 
     /**
