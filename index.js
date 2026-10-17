@@ -595,7 +595,7 @@ export async function init(router) {
     router.post('/embedding/capabilities', async (req, res) => {
         const {source, apiUrl, model} = req.body || {};
         if (['vllm','koboldcpp','bananabread','openrouter','electronhub','nanogpt','custom'].includes(source)) {
-            try { return res.json(await providerCapabilities(source,apiUrl,model,req.body?.apiKey)); }
+            try { return res.json(await providerCapabilities(source,apiUrl,model,req.body?.apiKey,fetch,req.body?.customEndpointMode||'base')); }
             catch(error) { return res.status(502).json({error:formatError(error)}); }
         }
         if (!['llamacpp','ollama'].includes(source) || !apiUrl)
@@ -640,6 +640,9 @@ export async function init(router) {
             // Their generic tokenizer endpoint is not guaranteed to use the
             // separate embeddings model. Never pass its count as exact.
             return res.status(422).json({error:`${source}: embedding-model tokenizer identity cannot be verified; configure the embedding token limit and use conservative splitting`});
+        }
+        if (source==='custom' && req.body?.customEndpointMode==='exact') {
+            return res.status(422).json({error:'Exact Custom API does not advertise a separate tokenizer endpoint; VectHare must use a configured safe token limit and conservative sizing.'});
         }
         if (['vllm','custom','nanogpt','openrouter','electronhub'].includes(source)) {
             try {
@@ -871,7 +874,7 @@ async function getVectorsForSource(source, texts, model, directories, req) {
     const openaiCompatible = new Set(['openai', 'openrouter', 'togetherai', 'mistral', 'electronhub', 'nanogpt', 'custom']);
     if (['nanogpt','custom'].includes(source) || (['openrouter','electronhub'].includes(source) && req.body?.apiUrl)) {
         const results=[];
-        for(let i=0;i<texts.length;i+=64) results.push(...await openAIEmbeddings(source,texts.slice(i,i+64),model,req.body?.apiUrl,req.body?.apiKey));
+        for(let i=0;i<texts.length;i+=64) results.push(...await openAIEmbeddings(source,texts.slice(i,i+64),model,req.body?.apiUrl,req.body?.apiKey,fetch,req.body?.customEndpointMode||'base'));
         return results;
     }
     if (openaiCompatible.has(source)) {
@@ -995,7 +998,7 @@ async function _getLegacySingleEmbedding(source, text, model, directories, req) 
         }
         case 'nanogpt':
         case 'custom': {
-            return (await openAIEmbeddings(source,[text],model,req.body?.apiUrl,req.body?.apiKey))[0];
+            return (await openAIEmbeddings(source,[text],model,req.body?.apiUrl,req.body?.apiKey,fetch,req.body?.customEndpointMode||'base'))[0];
         }
         case 'openai':
         case 'togetherai':
@@ -1784,7 +1787,7 @@ async function getEmbeddingForSource(source, text, model, directories, req) {
         }
         case 'nanogpt':
         case 'custom': {
-            return (await openAIEmbeddings(source,[text],model,req.body?.apiUrl,req.body?.apiKey))[0];
+            return (await openAIEmbeddings(source,[text],model,req.body?.apiUrl,req.body?.apiKey,fetch,req.body?.customEndpointMode||'base'))[0];
         }
         case 'openai':
         case 'togetherai':

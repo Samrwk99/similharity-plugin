@@ -15,8 +15,17 @@ export function providerBase(source, apiUrl) {
     if (url.username || url.password) throw new Error('Credentials in embedding URLs are not permitted');
     return url;
 }
-export function providerRoute(source, apiUrl, route) {
+export function providerRoute(source, apiUrl, route, customEndpointMode='base') {
     const url = providerBase(source, apiUrl);
+    if (source === 'custom') {
+        if (!['base','exact'].includes(customEndpointMode)) throw new Error('Unknown Custom API endpoint URL mode');
+        if (customEndpointMode === 'exact') {
+            if (route !== 'embeddings') throw new Error('Exact Custom API only defines an embeddings endpoint; auxiliary routes are unavailable');
+            if (url.hash) throw new Error('Custom API Exact Endpoint URL cannot contain a fragment (#)');
+            // Preserve the exact path AND query string, including signed URL parameters.
+            return url;
+        }
+    }
     // OpenAI-compatible base URLs may end with /v1, /api/v1 or /api/v1/embeddings.
     let path = url.pathname.replace(/\/+$/, '').replace(/\/embeddings$/, '');
     if (!path.endsWith('/v1') && !path.endsWith('/api/v1')) path += '/v1';
@@ -24,11 +33,11 @@ export function providerRoute(source, apiUrl, route) {
     url.search = ''; url.hash = '';
     return url;
 }
-export async function openAIEmbeddings(source, texts, model, apiUrl, apiKey, fetcher=fetch) {
+export async function openAIEmbeddings(source, texts, model, apiUrl, apiKey, fetcher=fetch, customEndpointMode='base') {
     if (!model || !String(model).trim()) throw new Error(`Select an embedding model for ${source}`);
     const headers = {'Content-Type':'application/json'};
     if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
-    const response = await fetcher(providerRoute(source,apiUrl,'embeddings'), {
+    const response = await fetcher(providerRoute(source,apiUrl,'embeddings',customEndpointMode), {
         method:'POST',headers,
         body:JSON.stringify({input:texts,model}),signal:AbortSignal.timeout(60000),
     });
@@ -53,8 +62,13 @@ export async function strictOllamaEmbedding(text, apiUrl, model, keep=false, api
     if(!Array.isArray(vector)||!vector.length||!vector.every(Number.isFinite)) throw new Error('Ollama returned no valid embedding');
     return vector;
 }
-export async function providerCapabilities(source,apiUrl,model,apiKey='',fetcher=fetch) {
+export async function providerCapabilities(source,apiUrl,model,apiKey='',fetcher=fetch,customEndpointMode='base') {
     const base=providerBase(source,apiUrl);
+    if(source==='custom' && customEndpointMode==='exact') {
+        providerRoute(source,apiUrl,'embeddings',customEndpointMode); // Validate the exact URL.
+        // No implicit /models or /tokenize route exists for an arbitrary endpoint.
+        return {success:true,modelId:model||null,limits:null,tokenizer:'unverified',endpointModeSupported:true,endpointMode:'exact'};
+    }
     if(source==='koboldcpp') return {success:true,modelId:model||null,limits:null,tokenizer:'unverified',reason:'Embedding model context (--embeddingsmaxctx) is independent from the text model and is not safely discoverable from /v1/models'};
     const headers={}; if(apiKey)headers.Authorization=`Bearer ${apiKey}`;
     const paths=source==='openrouter'?['embeddings/models']:['models'];
@@ -70,5 +84,5 @@ export async function providerCapabilities(source,apiUrl,model,apiKey='',fetcher
             return {success:true,modelId:row.id||model,limits:Number.isSafeInteger(maximum)&&maximum>0?{reportedContextTokens:maximum}:null,tokenizer:'unverified'};
         }catch{} // Discovery is optional; never silently claim to have learned a limit.
     }
-    return {success:true,modelId:model||null,limits:null,tokenizer:'unverified'};
+    return {success:true,modelId:model||null,limits:null,tokenizer:'unverified',...(source==='custom'?{endpointModeSupported:true,endpointMode:'base'}:{})};
 }
