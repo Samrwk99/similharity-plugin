@@ -278,6 +278,10 @@ class LanceDBBackend {
             .select(columns)
             .toArray();
 
+        if (options.strictRead && Number(await collection.countRows()) !== results.length) {
+            throw new Error(`Incomplete LanceDB listing for ${collectionId}`);
+        }
+
         return results.map(r => ({
             hash: Number(r.hash),
             text: r.text,
@@ -482,15 +486,32 @@ class LanceDBBackend {
      * @param {string} source - Embedding source
      * @returns {Promise<void>}
      */
+    /**
+     * Replace one record without a window where neither version exists.
+     * A changed hash is written first, then the old hash removed. An unchanged
+     * hash must be removed before re-adding; if that add fails, restore it.
+     */
+    async _replaceItem(collectionId, hash, existing, newItem, source) {
+        if (String(newItem.hash) !== String(hash)) {
+            await this.insertVectors(collectionId, [newItem], source);
+            await this.deleteVectors(collectionId, [hash], source);
+            return;
+        }
+        await this.deleteVectors(collectionId, [hash], source);
+        try {
+            await this.insertVectors(collectionId, [newItem], source);
+        } catch (error) {
+            await this.insertVectors(collectionId, [existing], source).catch(() => {});
+            throw error;
+        }
+    }
+
     async updateItem(collectionId, hash, updates, source = 'transformers') {
         // Get existing item
         const existing = await this.getItem(collectionId, hash, source);
         if (!existing) {
             throw new Error(`Item with hash ${hash} not found`);
         }
-
-        // Delete old item
-        await this.deleteVectors(collectionId, [hash], source);
 
         // Merge updates with existing data
         const newHash = updates.hash || hash;
@@ -501,8 +522,7 @@ class LanceDBBackend {
             metadata: { ...existing.metadata, ...updates },
         };
 
-        // Insert updated item
-        await this.insertVectors(collectionId, [newItem], source);
+        await this._replaceItem(collectionId, hash, existing, newItem, source);
 
         console.log(`[LanceDB] Updated item ${hash} -> ${newHash}`);
     }
@@ -522,9 +542,6 @@ class LanceDBBackend {
             throw new Error(`Item with hash ${hash} not found`);
         }
 
-        // Delete old item
-        await this.deleteVectors(collectionId, [hash], source);
-
         // Create updated item with same text/vector but new metadata
         const updatedItem = {
             hash: hash,
@@ -533,8 +550,7 @@ class LanceDBBackend {
             metadata: { ...existing.metadata, ...metadata },
         };
 
-        // Insert updated item
-        await this.insertVectors(collectionId, [updatedItem], source);
+        await this._replaceItem(collectionId, hash, existing, updatedItem, source);
 
         console.log(`[LanceDB] Updated metadata for item ${hash}`);
     }

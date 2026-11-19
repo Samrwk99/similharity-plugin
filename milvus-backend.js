@@ -368,15 +368,51 @@ class MilvusBackend {
         const mainCollection = 'vecthare_main';
 
         try {
+            if (!await this._collectionExists()) return;
             const expr = `hash in [${hashes.join(',')}]`;
-            await this.client.delete({
+            const res = await this.client.delete({
                 collection_name: mainCollection,
                 filter: expr
             });
+            this._assertSuccess(res, 'Delete');
             console.log(`[Milvus] Deleted items with hashes: ${hashes.length}`);
         } catch (error) {
             console.error('[Milvus] Delete failed:', error.message);
+            throw error; // never report a failed delete as success
         }
+    }
+
+    /** Absence is a legitimate empty result; any other failure must surface. */
+    async _collectionExists() {
+        const res = await this.client.hasCollection({ collection_name: 'vecthare_main' });
+        this._assertSuccess(res, 'Collection check');
+        return res?.value === true;
+    }
+
+    /** Milvus can answer with a non-Success status instead of throwing. */
+    _assertSuccess(res, action) {
+        // Data responses carry `status`; status-only responses (load, drop) ARE the status.
+        const status = res?.status ?? res;
+        const code = status?.error_code;
+        if (code !== undefined && code !== 'Success' && code !== 0) {
+            throw new Error(`[Milvus] ${action} failed: ${status.reason || code}`);
+        }
+    }
+
+    /**
+     * Exact number of records matching the same filter listItems uses.
+     * Independent of page size, so a truncated listing is detectable.
+     */
+    async countItems(filters = {}) {
+        if (!this.isConnected) throw new Error('Milvus not initialized');
+        const expr = this._buildFilterExpr(filters) || 'hash > 0';
+        if (!await this._collectionExists()) return 0;
+        this._assertSuccess(await this.client.loadCollection({ collection_name: 'vecthare_main' }), 'Load');
+        const res = await this.client.count({ collection_name: 'vecthare_main', expr, filter: expr });
+        this._assertSuccess(res, 'Count');
+        const total = Number(res?.data);
+        if (!Number.isSafeInteger(total) || total < 0) throw new Error('[Milvus] Invalid count response');
+        return total;
     }
 
     /**
@@ -403,8 +439,9 @@ class MilvusBackend {
         const filterExpr = this._buildFilterExpr(filters);
 
         try {
+            if (!await this._collectionExists()) return [];
             // Need to verify collection is loaded
-            await this.client.loadCollection({ collection_name: mainCollection });
+            this._assertSuccess(await this.client.loadCollection({ collection_name: mainCollection }), 'Load');
 
             const results = await this.client.search({
                 collection_name: mainCollection,
@@ -413,6 +450,8 @@ class MilvusBackend {
                 limit: topK,
                 output_fields: ['hash', 'text', 'metadata']
             });
+            this._assertSuccess(results, 'Search');
+            if (!Array.isArray(results?.results)) throw new Error('[Milvus] Invalid search response');
 
             return results.results.map(r => ({
                 hash: Number(r.hash),
@@ -423,7 +462,7 @@ class MilvusBackend {
 
         } catch (error) {
             console.error('[Milvus] Search failed:', error.message);
-            return [];
+            throw error; // an empty result must mean "no matches", not "failed"
         }
     }
 
@@ -437,7 +476,8 @@ class MilvusBackend {
         const filterExpr = this._buildFilterExpr(filters) || 'hash > 0'; // Always need an expression for query
 
         try {
-            await this.client.loadCollection({ collection_name: mainCollection });
+            if (!await this._collectionExists()) return [];
+            this._assertSuccess(await this.client.loadCollection({ collection_name: mainCollection }), 'Load');
 
             const output_fields = ['hash', 'text', 'metadata'];
             if (options.includeVectors) output_fields.push('vector');
@@ -454,6 +494,8 @@ class MilvusBackend {
                 limit: limit,
                 offset: offset
             });
+            this._assertSuccess(results, 'Query');
+            if (!Array.isArray(results?.data)) throw new Error('[Milvus] Invalid query response');
 
             return results.data.map(r => ({
                 hash: Number(r.hash),
@@ -464,7 +506,7 @@ class MilvusBackend {
 
         } catch (error) {
             console.error('[Milvus] List items failed:', error.message);
-            return [];
+            throw error; // an empty list must mean "empty collection", not "failed"
         }
     }
 
@@ -476,12 +518,15 @@ class MilvusBackend {
         const mainCollection = 'vecthare_main';
 
         try {
+            if (!await this._collectionExists()) return null;
             const results = await this.client.query({
                 collection_name: mainCollection,
                 filter: `hash == ${hash}`,
                 output_fields: ['hash', 'text', 'vector', 'metadata'],
                 limit: 1
             });
+            this._assertSuccess(results, 'Get item');
+            if (!Array.isArray(results?.data)) throw new Error('[Milvus] Invalid query response');
 
             if (results.data.length === 0) return null;
             const r = results.data[0];
@@ -495,7 +540,7 @@ class MilvusBackend {
 
         } catch (error) {
             console.error('[Milvus] Get item failed:', error.message);
-            return null;
+            throw error; // null must mean "not found", not "failed"
         }
     }
 
@@ -506,8 +551,6 @@ class MilvusBackend {
         const existing = await this.getItem(collectionName, hash, filters);
         if (!existing) throw new Error(`Item ${hash} not found`);
 
-        await this.deleteVectors(collectionName, [hash]);
-
         const newHash = updates.hash || hash;
         const newItem = {
             hash: newHash,
@@ -516,7 +559,21 @@ class MilvusBackend {
             metadata: { ...existing.metadata, ...updates }
         };
 
-        await this.insertVectors(collectionName, [newItem], filters);
+        if (String(newHash) !== String(hash)) {
+            // Write the replacement first; remove the old hash only afterwards.
+            await this.insertVectors(collectionName, [newItem], filters);
+            await this.deleteVectors(collectionName, [hash]);
+            return;
+        }
+        // Milvus insert does not replace an existing key: remove, add, and
+        // restore the original if the add fails.
+        await this.deleteVectors(collectionName, [hash]);
+        try {
+            await this.insertVectors(collectionName, [newItem], filters);
+        } catch (error) {
+            await this.insertVectors(collectionName, [existing], filters).catch(() => {});
+            throw error;
+        }
     }
 
     /**
@@ -533,19 +590,24 @@ class MilvusBackend {
             if (hasFilters) {
                 const expr = this._buildFilterExpr(filters);
                 if (expr) {
-                    await this.client.delete({
+                    const res = await this.client.delete({
                         collection_name: mainCollection,
                         filter: expr
                     });
+                    this._assertSuccess(res, 'Purge');
                     console.log(`[Milvus] Purged items with filter: ${expr}`);
                 }
             } else {
-                await this.client.dropCollection({ collection_name: mainCollection });
+                const exists = await this.client.hasCollection({ collection_name: mainCollection });
+                if (exists?.value === false) return; // nothing to drop
+                const res = await this.client.dropCollection({ collection_name: mainCollection });
+                this._assertSuccess(res, 'Drop collection');
                 console.log(`[Milvus] Dropped collection ${mainCollection}`);
                 // Re-create is handled by next insert/init
             }
         } catch (error) {
             console.error('[Milvus] Purge failed:', error.message);
+            throw error; // a failed purge must not be reported as a confirmed deletion
         }
     }
 

@@ -146,10 +146,8 @@ export async function init(router) {
                         const newVector = await getEmbeddingForSource(source, newText, model, directories, req);
                         const newHash = getStringHash(newText);
 
-                        // Delete old item
-                        await store.deleteItem(item.id);
-
-                        // Insert updated item
+                        // Write the replacement first; the original is removed (by id)
+                        // only after it is stored, so a failed write loses nothing.
                         await store.beginUpdate();
                         await store.upsertItem({
                             vector: newVector,
@@ -160,6 +158,7 @@ export async function init(router) {
                             }
                         });
                         await store.endUpdate();
+                        await store.deleteItem(item.id);
 
                         return { oldHash: hash, newHash, text: newText };
                     },
@@ -170,9 +169,8 @@ export async function init(router) {
                         const item = items.find(i => i.metadata.hash == hash);
                         if (!item) throw new Error('Chunk not found');
 
-                        // Delete and re-insert with same vector but updated metadata
-                        await store.deleteItem(item.id);
-
+                        // Re-insert with same vector but updated metadata, then remove
+                        // the original (by id) only after the replacement is stored.
                         await store.beginUpdate();
                         await store.upsertItem({
                             vector: item.vector,
@@ -184,6 +182,7 @@ export async function init(router) {
                             }
                         });
                         await store.endUpdate();
+                        await store.deleteItem(item.id);
 
                         return { hash, metadata };
                     },
@@ -494,12 +493,17 @@ export async function init(router) {
                         const items = await milvusBackend.listItems(collectionId, options.filters || {}, options);
                         const offset = options.offset || 0;
                         const limit = options.limit || items.length;
+                        // Report the collection's real size, not the page length, so
+                        // callers can tell a complete listing from a truncated one.
+                        let total = null;
+                        try { total = await milvusBackend.countItems(options.filters || {}); }
+                        catch (error) { if (options.strictRead) throw error; }
                         return {
                             items: items,
-                            total: items.length,
+                            total: total ?? offset + items.length,
                             offset,
                             limit,
-                            hasMore: items.length >= limit
+                            hasMore: total !== null ? offset + items.length < total : items.length >= limit
                         };
                     },
 
@@ -1087,13 +1091,16 @@ export async function init(router) {
      */
     router.post('/get-embedding', async (req, res) => {
         try {
-            const { text, source, model = '' } = req.body;
+            const { text, source, model = '', isQuery = false } = req.body;
 
             if (!text || !source) {
                 return res.status(400).json({ error: 'text and source are required' });
             }
 
-            const embedding = await getEmbeddingForSource(source, text, model, req.user.directories, req);
+            // #14: the caller says whether this is a search query or a stored
+            // passage; asymmetric providers (Cohere) need the distinction.
+            const embedding = await getEmbeddingForSource(source, text, model, req.user.directories, req,
+                isQuery === true);
             res.json({ success: true, embedding });
 
         } catch (error) {
@@ -1217,7 +1224,7 @@ export async function init(router) {
 /**
  * Get multiple embeddings for texts from specified source
  */
-async function getVectorsForSource(source, texts, model, directories, req) {
+async function getVectorsForSource(source, texts, model, directories, req, isQuery = false) {
     // Specialized batch handling
     if (source === 'bananabread') {
         // BananaBread llama.cpp-compatible endpoint
@@ -1298,16 +1305,18 @@ async function getVectorsForSource(source, texts, model, directories, req) {
     // Default fallback: sequential processing for other sources
     const results = [];
     for (const text of texts) {
-        results.push(await _getLegacySingleEmbedding(source, text, model, directories, req));
+        results.push(await _getLegacySingleEmbedding(source, text, model, directories, req, isQuery));
     }
     return results;
 }
 
 /**
  * Wrapper for single embedding (backwards compatibility)
+ * `isQuery` matters for providers with asymmetric embeddings (Cohere): a stored
+ * passage and a search query must not be embedded the same way (#14).
  */
-async function getEmbeddingForSource(source, text, model, directories, req) {
-    const vectors = await getVectorsForSource(source, [text], model, directories, req);
+async function getEmbeddingForSource(source, text, model, directories, req, isQuery = false) {
+    const vectors = await getVectorsForSource(source, [text], model, directories, req, isQuery);
     return vectors[0];
 }
 
@@ -1361,7 +1370,7 @@ async function _getKoboldCppEmbedding(text, model, req) {
 /**
  * Legacy single embedding function (renamed)
  */
-async function _getLegacySingleEmbedding(source, text, model, directories, req) {
+async function _getLegacySingleEmbedding(source, text, model, directories, req, isQuery = false) {
     switch (source) {
         case 'transformers': {
             const { getTransformersVector } = await import('../../src/vectors/embedding.js');
@@ -1382,8 +1391,11 @@ async function _getLegacySingleEmbedding(source, text, model, directories, req) 
             return await getNomicAIVector(text, source, directories);
         }
         case 'cohere': {
+            // #14: Cohere needs search_query for queries and search_document for
+            // stored passages. This was hard-coded to the query form, so every
+            // inserted chunk was embedded as if it were a search query.
             const { getCohereVector } = await import('../../src/vectors/cohere-vectors.js');
-            return await getCohereVector(text, true, directories, model);
+            return await getCohereVector(text, isQuery === true, directories, model);
         }
         case 'koboldcpp': {
             return await _getKoboldCppEmbedding(text, model, req);
@@ -1448,6 +1460,7 @@ async function _getLegacySingleEmbedding(source, text, model, directories, req) 
                 limit = 100,
                 includeVectors = false,
                 hashesOnly = false,
+                strictRead = false,
                 filters = {}
             } = req.body;
 
@@ -1466,6 +1479,7 @@ async function _getLegacySingleEmbedding(source, text, model, directories, req) 
                 limit,
                 includeVectors,
                 hashesOnly,
+                strictRead: strictRead === true,
                 filters
             });
 
@@ -1754,7 +1768,7 @@ async function _getLegacySingleEmbedding(source, text, model, directories, req) 
             // Get query vector if not provided
             let vector = queryVector;
             if (!vector && searchText) {
-                vector = await getEmbeddingForSource(source, searchText, model, req.user.directories, req);
+                vector = await getEmbeddingForSource(source, searchText, model, req.user.directories, req, true);
             }
 
             const handler = getBackendHandler(backend);
@@ -1813,7 +1827,7 @@ async function _getLegacySingleEmbedding(source, text, model, directories, req) 
             // Generate embedding if searchText provided
             let vector = queryVector;
             if (!vector && searchText) {
-                vector = await getEmbeddingForSource(source, searchText, model, req.user.directories, req);
+                vector = await getEmbeddingForSource(source, searchText, model, req.user.directories, req, true);
             }
 
             // Extract keywords if not provided
@@ -2076,113 +2090,6 @@ async function getIndex(directories, collectionId, source, model) {
     }
 
     return store;
-}
-
-/**
- * Get embedding for text from specified source
- */
-async function getEmbeddingForSource(source, text, model, directories, req) {
-    switch (source) {
-        case 'transformers': {
-            const { getTransformersVector } = await import('../../src/vectors/embedding.js');
-            return await getTransformersVector(text);
-        }
-        case 'openai':
-        case 'togetherai':
-        case 'mistral':
-        case 'electronhub':
-        case 'openrouter': {
-            const { getOpenAIVector } = await import('../../src/vectors/openai-vectors.js');
-            // ElectronHub requires a model name, provide default if empty
-            const effectiveModel = (source === 'electronhub' && !model) ? 'text-embedding-ada-002' : model;
-            return await getOpenAIVector(text, source, directories, effectiveModel);
-        }
-        case 'koboldcpp': {
-            return await _getKoboldCppEmbedding(text, model, req);
-        }
-        case 'nomicai': {
-            const { getNomicAIVector } = await import('../../src/vectors/nomicai-vectors.js');
-            return await getNomicAIVector(text, source, directories);
-        }
-        case 'cohere': {
-            const { getCohereVector } = await import('../../src/vectors/cohere-vectors.js');
-            return await getCohereVector(text, true, directories, model);
-        }
-        case 'ollama': {
-            const { getOllamaVector } = await import('../../src/vectors/ollama-vectors.js');
-            const apiUrl = req.body?.apiUrl || 'http://localhost:11434';
-            const keep = req.body?.keep || false;
-            return await getOllamaVector(text, apiUrl, model, keep, directories);
-        }
-        case 'llamacpp': {
-            const { getLlamaCppVector } = await import('../../src/vectors/llamacpp-vectors.js');
-            const apiUrl = req.body?.apiUrl || 'http://localhost:8080';
-            return await getLlamaCppVector(text, apiUrl, directories);
-        }
-        case 'bananabread': {
-            // BananaBread llama.cpp-compatible endpoint (no model param needed - uses server config)
-            let apiUrl = req.body.apiUrl || 'http://localhost:8008';
-            let apiKey = req.body.apiKey || '';
-
-            // Validate URL before attempting to use it
-            if (!apiUrl || typeof apiUrl !== 'string' || apiUrl.trim() === '') {
-                throw new Error('BananaBread: apiUrl is missing or invalid. Configure the embedding URL in VectHare settings.');
-            }
-            apiUrl = apiUrl.trim();
-
-            let url;
-            try {
-                url = new URL(apiUrl);
-                url.pathname = '/embedding';
-            } catch (e) {
-                throw new Error(`BananaBread: Invalid URL format "${apiUrl}" - ${e.message}`);
-            }
-
-            const headers = { 'Content-Type': 'application/json' };
-            if (apiKey) {
-                headers['Authorization'] = `Bearer ${apiKey}`;
-            }
-
-            const response = await fetch(url.toString(), {
-                method: 'POST',
-                headers: headers,
-                body: JSON.stringify({ content: text }),
-            });
-
-            if (!response.ok) {
-                const errorText = await response.text();
-                throw new Error(`BananaBread: ${response.statusText} ${errorText}`);
-            }
-
-            const data = await response.json();
-            if (!Array.isArray(data?.embedding)) {
-                throw new Error('BananaBread: Invalid response format');
-            }
-            return data.embedding;
-        }
-        case 'vllm': {
-            const { getVllmVector } = await import('../../src/vectors/vllm-vectors.js');
-            const apiUrl = req.body?.apiUrl || 'http://localhost:8000';
-            return await getVllmVector(text, apiUrl, model, directories);
-        }
-        case 'palm':
-        case 'vertexai': {
-            const googleVectors = await import('../../src/vectors/google-vectors.js');
-            if (source === 'palm') {
-                return await googleVectors.getMakerSuiteVector(text, model, req);
-            } else {
-                return await googleVectors.getVertexVector(text, model, req);
-            }
-        }
-        case 'extras': {
-            const { getExtrasVector } = await import('../../src/vectors/extras-vectors.js');
-            const extrasUrl = req.body?.extrasUrl || 'http://localhost:5100';
-            const extrasKey = req.body?.extrasKey || '';
-            return await getExtrasVector(text, extrasUrl, extrasKey);
-        }
-        default:
-            throw new Error(`Unknown vector source: ${source}`);
-    }
 }
 
 /**

@@ -432,15 +432,15 @@ class QdrantBackend {
                 messageIndex: item.metadata?.messageIndex,
 
                 // ===== LEGACY VECTHARE FEATURES =====
-                importance: item.importance !== undefined ? item.importance : 100,
+                importance: item.importance ?? item.metadata?.importance ?? 100,
                 keywords: item.keywords || item.metadata?.keywords || [],
-                customWeights: item.customWeights || {},
-                disabledKeywords: item.disabledKeywords || [],
-                chunkGroup: item.chunkGroup || null,
-                conditions: item.conditions || null,
-                summary: item.summary || null,
-                isSummaryChunk: item.isSummaryChunk || false,
-                parentHash: item.parentHash || null,
+                customWeights: item.customWeights || item.metadata?.customWeights || {},
+                disabledKeywords: item.disabledKeywords || item.metadata?.disabledKeywords || [],
+                chunkGroup: item.chunkGroup || item.metadata?.chunkGroup || null,
+                conditions: item.conditions || item.metadata?.conditions || null,
+                summary: item.summary || item.metadata?.summary || null,
+                isSummaryChunk: item.isSummaryChunk || item.metadata?.isSummaryChunk || false,
+                parentHash: item.parentHash || item.metadata?.parentHash || null,
 
                 // ===== CHAT-SPECIFIC =====
                 speaker: item.metadata?.speaker,
@@ -1015,6 +1015,11 @@ class QdrantBackend {
                 }
 
                 const response = await this._request('POST', `/collections/${mainCollection}/points/scroll`, scrollPayload);
+                // A success-shaped reply without a points array is not an empty
+                // final page; never let it end the listing as "complete".
+                if (!Array.isArray(response?.result?.points)) {
+                    throw new Error(`Invalid Qdrant scroll response for ${mainCollection}`);
+                }
                 if (options.hashesOnly && (!Array.isArray(response?.result?.points) ||
                     response.result.points.some(point => point?.payload?.hash === undefined ||
                         point.payload.hash === null))) {
@@ -1032,6 +1037,16 @@ class QdrantBackend {
                 offset = response.result?.next_page_offset;
             } while (offset !== null && offset !== undefined);
 
+            if (options.strictRead) {
+                // Independent completeness evidence: Qdrant's own exact count for
+                // the same filter must equal what the scroll returned.
+                const counted = await this._request('POST', `/collections/${mainCollection}/points/count`, {
+                    exact: true, ...(must.length > 0 ? { filter: { must } } : {}),
+                });
+                if (!Number.isSafeInteger(counted?.result?.count) || counted.result.count !== items.length) {
+                    throw new Error(`Incomplete Qdrant listing for ${mainCollection}: scrolled ${items.length}, collection reports ${counted?.result?.count}`);
+                }
+            }
             console.log(">>> [Qdrant] Listed", items.length, "items from", mainCollection);
             return items;
         } catch (error) {
@@ -1306,9 +1321,6 @@ class QdrantBackend {
             throw new Error(`Item with hash ${hash} not found`);
         }
 
-        // Delete old item
-        await this.deleteVectors(collectionName, [hash]);
-
         // Merge updates with existing data
         const newHash = updates.hash || hash;
         const newItem = {
@@ -1318,8 +1330,10 @@ class QdrantBackend {
             metadata: { ...existing.metadata, ...updates },
         };
 
-        // Insert updated item
+        // Write the replacement first (a point's ID is its hash, so an upsert
+        // replaces in place); remove the old hash only if it actually changed.
         await this.insertVectors(collectionName, [newItem], filters);
+        if (String(newHash) !== String(hash)) await this.deleteVectors(collectionName, [hash]);
 
         console.log(`[Qdrant] Updated item ${hash} -> ${newHash}`);
     }
@@ -1341,9 +1355,6 @@ class QdrantBackend {
             throw new Error(`Item with hash ${hash} not found`);
         }
 
-        // Delete old item
-        await this.deleteVectors(collectionName, [hash]);
-
         // Create updated item with same text/vector but new metadata
         const updatedItem = {
             hash: hash,
@@ -1352,7 +1363,7 @@ class QdrantBackend {
             metadata: { ...existing.metadata, ...metadata },
         };
 
-        // Insert updated item
+        // Same hash = same point ID: the upsert replaces it in place.
         await this.insertVectors(collectionName, [updatedItem], filters);
 
         console.log(`[Qdrant] Updated metadata for item ${hash}`);
