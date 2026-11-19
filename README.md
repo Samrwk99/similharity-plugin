@@ -981,3 +981,81 @@ Coneja-Chibi
 ## Repository
 
 [https://github.com/Conejachibi/VectHare](https://github.com/Conejachibi/VectHare)
+
+
+## Key store (build 13.22)
+
+Qdrant API key and Milvus token/password are kept per user in
+`<user>/vectors/vecthare-owned-state/secrets.json` (written atomically, mode 0600 where the
+OS supports it). The browser can only ask whether a name is set (`POST /secrets/status`),
+replace it or remove it (`POST /secrets/set {name, value}`, empty value removes). No route
+returns a value. When Qdrant/Milvus is initialised the stored value is used in place of any
+value in the request, so older extension builds keep working until they migrate.
+
+## Outbound URL guard
+
+Fetches the plugin makes itself (BananaBread and KoboldCpp embeddings, `/rerank`) are
+unrestricted while SillyTavern has a single user. With more than one user, loopback,
+private-network, link-local and non-http(s) targets are refused. The server admin can allow
+them with the environment variable `SIMILHARITY_ALLOW_PRIVATE_URLS=1`. The check is best
+effort (the name is resolved once for the check and again by the fetch).
+
+## Storage report (build 13.29)
+
+`POST /storage/report` with `{ "defaults": { "backend", "source", "model", "qdrantMultitenancy" } }`
+(today's VectHare settings, only used to say what today's settings-based rule would pick).
+**Read-only**: it reads the caller's `collections.json` and every backend that is already
+connected on the server, and never creates, changes or deletes anything. For each recorded
+collection it returns the layout (`per-collection`, `legacy-mt`, `legacy-shared`, `conflict`,
+`not-found`, `unknown`), the physical store, the vector count and where the saved original
+settings were found (`found` / `missing` / `multiple` / `invalid` / `unavailable`). It also
+lists the shared stores (for legacy Qdrant multitenancy: vectors per `content_type` and the
+number with none) and VectHare-named physical stores no record points at. On a multi-user
+server (or when the user count cannot be confirmed) other users' names are only shown to an
+admin; everyone else sees counts. `/health` advertises `capabilities.storageReport: 1`.
+
+Deletes in the legacy shared Qdrant store (`vecthare_multitenancy`) are limited to the
+caller's own points (`content_type`); a delete there without that scope is refused (409).
+
+## Storage locators (build 13.30)
+
+The extension records, per collection, where its vectors and saved original settings are
+(`collections[id].storage` in `collections.json`). `/storage/report` shows that locator for
+each collection (`locator`, `locatorAgrees`) and counts them in `summary.locators` /
+`summary.locatorDisagrees`. Milvus hybrid queries are answered with 400 at once (no native
+hybrid query for Milvus); callers fall back to vector search.
+
+## Multitenancy v2 (build 13.31)
+
+`/health` advertises `capabilities.scopedTenancy: 2`. A request that carries
+`storage: { layout, dim?, physical? }` (`layout`: Qdrant `mt-v2`; Milvus `mt-v2` or
+`per-collection`) is scoped by the plugin: the tenant key is
+`<ST user handle>/<type>/<sourceId>` (from `req.user` and the validated collection id, max
+512 characters), client filters are dropped, and the physical store is
+`vecthare_mt_<dim>` (shared, never dropped) or, for Milvus per-collection,
+`vh_<first 24 hex of sha1(tenantKey)>`. Without `dim` the plugin finds the store holding the
+tenant (or creates `vecthare_mt_<dim>` at the first insert, and returns `storage` in the insert
+reply). Qdrant point ids are UUIDv5(tenantKey:hash). Saved original settings are kept in the
+physical store under `vecthare_initial_<sha256(tenantKey)>`; a purge empties that slot with a
+`{vecthareTombstone: 1}` marker. Milvus v2 needs server 2.2.9 or newer.
+
+Legacy multitenancy (`vecthare_multitenancy`): reads are limited to one collection when the
+request names `filters.content_type` explicitly (requests without it are unchanged).
+
+## Move storage and ownership (build 13.32)
+
+`POST /storage/move` (Qdrant/Milvus, same server only):
+
+- `{action: 'copy', backend, collectionId, from: {layout, physical, dim?}, to: {layout}, embedding: {source, model}}`
+  copies one collection's vectors to the other layout without re-embedding, verifies the count
+  and 5 random vectors, and returns `{copied, sourceCount, target: {layout, physical, dim}}`. The
+  target must hold nothing for the collection (vectors or live saved settings). Legacy Qdrant
+  multitenancy is refused as a source; neither old shared store is offered as a target. Milvus is
+  limited to 16000 vectors per move. On a failure the partial target is removed.
+- `{action: 'delete-copy', backend, collectionId, location}` deletes one copy (vectors, then its
+  saved settings slot as a tombstone; shared stores are never dropped) and verifies it is empty.
+  Refused (409) for the location VectHare's metadata file records as current.
+
+Saved original settings on Qdrant/Milvus carry `owner` (the ST user handle, set by the plugin).
+On a multi-user server a non-admin user cannot use a per-collection Qdrant store stamped by another
+user, and `/collections` lists per-collection Qdrant stores only to their owner (unstamped: admins).

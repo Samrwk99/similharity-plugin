@@ -24,6 +24,8 @@
  * ============================================================================
  */
 
+import { uuidv5, MT_V2_NAME } from './tenancy.js';
+
 /**
  * Qdrant Backend Manager
  * Manages Qdrant REST API connection and operations
@@ -35,7 +37,47 @@ const KNOWN_EMBEDDING_SOURCES = new Set([
     'togetherai', 'extras',
 ]);
 
+/** H2: physical Qdrant/Milvus collections shared by many VectHare collections. */
+export function isReservedSharedCollection(name) {
+    return typeof name === 'string' && /^(vecthare_main|vecthare_multitenancy|vecthare_mt_\d+)$/.test(name);
+}
+
+/** A logical collection id as legacy multitenancy stores it in `content_type`. */
+export function isLegacyContentType(value) {
+    return typeof value === 'string' && value.length <= 255 && /^vecthare_[^\u0000-\u001f]+$/.test(value);
+}
+
+/**
+ * The old extension sends its legacy-multitenancy scope as
+ * `filter: { must: [{ key: 'content_type', match: { value } }] }` (singular
+ * `filter`, which the plugin never read). Returns that value, or null.
+ */
+export function legacyContentTypeFromFilter(filter) {
+    const must = Array.isArray(filter?.must) ? filter.must : [];
+    const hits = must.filter(c => c?.key === 'content_type');
+    if (hits.length !== 1) return null;
+    const value = hits[0]?.match?.value;
+    return isLegacyContentType(value) ? value : null;
+}
+
 class QdrantBackend {
+    /**
+     * 9c: extra scope conditions. `tenantKey` (v2 layouts, set by the plugin's
+     * route guard only) and `content_type` (legacy multitenancy, when the caller
+     * asked for it explicitly). Empty for every other request, so legacy request
+     * bodies are unchanged.
+     */
+    _extraScope(filters = {}) {
+        const must = [];
+        if (typeof filters?.tenantKey === 'string' && filters.tenantKey) {
+            must.push({ key: 'tenantKey', match: { value: filters.tenantKey } });
+        }
+        if (typeof filters?.content_type === 'string' && filters.content_type) {
+            must.push({ key: 'content_type', match: { value: filters.content_type } });
+        }
+        return must;
+    }
+
     _isNotFound(error) {
         // Other 404s (unsupported endpoint, proxy route, etc.) are real errors.
         return error?.status === 404 &&
@@ -221,7 +263,9 @@ class QdrantBackend {
         if (metadata != null && (typeof metadata !== 'object' || Array.isArray(metadata))) {
             throw new Error('Qdrant returned invalid collection metadata');
         }
-        return metadata?.[key];
+        const value = metadata?.[key];
+        // 9c: a purged v2 tenant leaves a tombstone; it reads as "missing".
+        return value && value.vecthareTombstone === 1 ? undefined : value;
     }
 
     /** Write-once provenance stored in Qdrant's native collection metadata (1.16+). */
@@ -231,7 +275,7 @@ class QdrantBackend {
         const endpoint = `/collections/${name}`;
         const info = await this._request('GET', endpoint);
         const metadata = info?.result?.config?.metadata || {};
-        if (metadata[key] !== undefined) {
+        if (metadata[key] !== undefined && !(metadata[key] && metadata[key].vecthareTombstone === 1)) {
             if (metadata[key]?.collectionId !== value.collectionId ||
                 metadata[key]?.snapshot?.schemaVersion !== 1) {
                 throw new Error('Existing Qdrant initial configuration is invalid or belongs to another collection');
@@ -413,7 +457,20 @@ class QdrantBackend {
         const points = items.map(item => ({
             id: typeof item.hash === 'string' ? parseInt(item.hash, 10) : item.hash, // Ensure numeric ID for Qdrant
             vector: item.vector,
-            payload: {
+            payload: this._payload(item, tenantMetadata),
+        }));
+
+        // Upsert points (PUT with wait=true for reliability)
+        await this._request('PUT', `/collections/${mainCollection}/points?wait=true`, {
+            points: points,
+        });
+
+        console.log(`[Qdrant] Inserted ${items.length} vectors into ${mainCollection} (type: ${tenantMetadata.type}, sourceId: ${tenantMetadata.sourceId})`);
+    }
+
+    /** The stored payload of one item (shared by the legacy and v2 layouts). */
+    _payload(item, tenantMetadata) {
+        return {
                 // ===== SPREAD ADDITIONAL METADATA FIRST (so it can be overridden) =====
                 ...(item.metadata || {}),
 
@@ -461,15 +518,7 @@ class QdrantBackend {
                 documentName: item.metadata?.documentName,
                 url: item.metadata?.url,
                 scrapeDate: item.metadata?.scrapeDate,
-            },
-        }));
-
-        // Upsert points (PUT with wait=true for reliability)
-        await this._request('PUT', `/collections/${mainCollection}/points?wait=true`, {
-            points: points,
-        });
-
-        console.log(`[Qdrant] Inserted ${items.length} vectors into ${mainCollection} (type: ${tenantMetadata.type}, sourceId: ${tenantMetadata.sourceId})`);
+        };
     }
 
     /**
@@ -552,6 +601,8 @@ class QdrantBackend {
                     match: { value: filters.embeddingSource }
                 });
             }
+            // 9c: v2 tenant scope / explicit legacy content_type scope.
+            must.push(...this._extraScope(filters));
 
             // Build search payload
             const searchPayload = {
@@ -684,6 +735,8 @@ class QdrantBackend {
                     match: { value: filters.embeddingSource }
                 });
             }
+            // 9c: v2 tenant scope / explicit legacy content_type scope.
+            must.push(...this._extraScope(filters));
 
             // ================================================================
             // STRATEGY 1: Vector Search (Semantic Similarity)
@@ -993,6 +1046,7 @@ class QdrantBackend {
                     match: { value: filters.sourceId }
                 });
             }
+            must.push(...this._extraScope(filters));
 
             // Scroll through all points
             const items = [];
@@ -1090,6 +1144,7 @@ class QdrantBackend {
                     match: { value: filters.sourceId }
                 });
             }
+            must.push(...this._extraScope(filters));
 
             // Scroll through all points to get hashes
             const hashes = [];
@@ -1130,20 +1185,40 @@ class QdrantBackend {
      * @param {number[]} hashes - Hashes to delete
      * @returns {Promise<void>}
      */
-    async deleteVectors(collectionName, hashes) {
+    async deleteVectors(collectionName, hashes, filters = {}) {
         if (!this.baseUrl) throw new Error('Qdrant not initialized');
         if (hashes.length === 0) return;
 
         collectionName = this._parseCollectionName(collectionName);
         const mainCollection = collectionName;
 
+        // 9a fix: the legacy shared store keeps every collection's points side by
+        // side, and a point id is only the text hash. A delete by id therefore
+        // removed whichever collection's point carried that hash - e.g. Sync's
+        // ghost cleanup in one chat deleting another chat's vectors. Deletes in
+        // that store are now limited to the caller's own points (content_type),
+        // and refused when the caller does not say which collection it is.
+        let legacyScope = null;
+        if (mainCollection === 'vecthare_multitenancy') {
+            legacyScope = filters?.content_type;
+            if (!isLegacyContentType(legacyScope)) {
+                const error = new Error('Deleting from the shared Qdrant store needs the collection it belongs to; nothing was deleted.');
+                error.status = 409;
+                throw error;
+            }
+        }
+
         try {
             // Delete points by ID (hash)
             // Ensure hashes are numbers - Qdrant requires unsigned integers or UUID strings
             const numericHashes = hashes.map(h => typeof h === 'string' ? parseInt(h, 10) : h);
-            await this._request('POST', `/collections/${mainCollection}/points/delete?wait=true`, {
-                points: numericHashes,
-            });
+            await this._request('POST', `/collections/${mainCollection}/points/delete?wait=true`,
+                legacyScope === null ? { points: numericHashes } : {
+                    filter: { must: [
+                        { has_id: numericHashes },
+                        { key: 'content_type', match: { value: legacyScope } },
+                    ] },
+                });
 
             console.log(`[Qdrant] Deleted ${hashes.length} items from ${mainCollection}`);
         } catch (error) {
@@ -1214,11 +1289,19 @@ class QdrantBackend {
      * WARNING: Deletes ALL data from ALL sources
      * @returns {Promise<void>}
      */
-    async purgeAll(collectionName = 'vecthare_main') {
+    async purgeAll(collectionName) {
         if (!this.baseUrl) throw new Error('Qdrant not initialized');
 
         collectionName = this._parseCollectionName(collectionName);
         const mainCollection = collectionName;
+        // H2: a shared physical store holds many VectHare collections; no route
+        // may drop it. One wrong id here used to delete every chat's vectors.
+        if (isReservedSharedCollection(mainCollection)) {
+            const error = new Error(`Refusing to delete shared store "${mainCollection}": it holds several collections. ` +
+                'Delete individual collections instead; nothing was changed.');
+            error.status = 409;
+            throw error;
+        }
 
         try {
             await this._request('DELETE', `/collections/${mainCollection}`);
@@ -1251,6 +1334,189 @@ class QdrantBackend {
         const names = collections.result?.collections?.map(item => item.name);
         if (!Array.isArray(names)) throw new Error('Qdrant returned no collection list');
         return names.includes(collectionName);
+    }
+
+    // ========================================================================
+    // 9c: MULTITENANCY v2 (vecthare_mt_<dim>)
+    // ========================================================================
+    // One shared collection per vector size. Every operation is scoped by the
+    // plugin-computed tenantKey; a point id is UUIDv5(tenantKey:hash), so the
+    // same text in two collections never shares a point and re-inserting a
+    // chunk is idempotent. The physical collection is never dropped (H2).
+
+    /** Creates the v2 collection (vector size `dim`) and its payload indexes when missing. */
+    async ensureV2Collection(name, dim) {
+        if (!this.baseUrl) throw new Error('Qdrant not initialized');
+        if (!MT_V2_NAME.test(name)) throw new Error(`Not a v2 collection name: ${name}`);
+        // The name carries the vector size, so a store checked once stays valid
+        // (it is never dropped); skip the two extra reads on later inserts.
+        this.v2Ensured ??= new Set();
+        const memo = `${this.baseUrl}\u0000${name}`;
+        if (this.v2Ensured.has(memo) && Number(MT_V2_NAME.exec(name)[1]) === dim) return;
+        let info = null;
+        try {
+            info = await this._request('GET', `/collections/${name}`);
+        } catch (error) {
+            if (!this._isNotFound(error)) throw error;
+        }
+        if (info) {
+            const size = info.result?.config?.params?.vectors?.size;
+            if (size && size !== dim) {
+                const error = new Error(`[Qdrant] ${name} holds ${size}-dim vectors; this model makes ${dim}. Nothing was changed.`);
+                error.status = 409;
+                throw error;
+            }
+            await this._ensureV2Indexes(name);
+            this.v2Ensured.add(memo);
+            return;
+        }
+        await this._request('PUT', `/collections/${name}`, { vectors: { size: dim, distance: 'Cosine' } });
+        console.log(`[Qdrant] Created v2 collection: ${name} (dim=${dim})`);
+        await this._ensureV2Indexes(name);
+        this.v2Ensured.add(memo);
+    }
+
+    async _ensureV2Indexes(name) {
+        const info = await this._request('GET', `/collections/${name}`);
+        const existing = info.result?.payload_schema || {};
+        const wanted = [
+            { field: 'tenantKey', schema: { type: 'keyword', is_tenant: true } },
+            { field: 'hash', schema: 'integer' },
+            { field: 'embeddingSource', schema: 'keyword' },
+            { field: 'keywords', schema: 'keyword' },
+            { field: 'keywords[].text', schema: { type: 'text', tokenizer: 'word', lowercase: true } },
+            { field: 'text', schema: 'text' },
+            { field: 'timestamp', schema: 'integer' },
+            { field: 'importance', schema: 'integer' },
+        ];
+        for (const { field, schema } of wanted) {
+            const type = typeof schema === 'string' ? schema : schema.type;
+            if (existing[field]?.data_type === type) continue;
+            try {
+                await this._request('PUT', `/collections/${name}/index?wait=true`, { field_name: field, field_schema: schema });
+            } catch (error) {
+                if (!/already exists|409/.test(String(error.message))) {
+                    console.warn(`[Qdrant] Failed to create index ${field} on ${name}:`, error.message);
+                }
+            }
+        }
+    }
+
+    /** Point id of one chunk of one tenant. */
+    v2PointId(tenantKey, hash) {
+        return uuidv5(`${tenantKey}:${hash}`);
+    }
+
+    /** Insert/upsert into a v2 collection. `tenant` = {tenantKey, user, type, sourceId}. */
+    async insertV2(name, items, tenant, embedding = {}) {
+        if (!this.baseUrl) throw new Error('Qdrant not initialized');
+        if (!items.length) return;
+        if (items.some(item => !Array.isArray(item.vector) || !item.vector.length)) {
+            throw new Error('[Qdrant] Items are missing vectors');
+        }
+        const dim = items[0].vector.length;
+        if (items.some(item => item.vector.length !== dim)) throw new Error('[Qdrant] Vector dimension mismatch inside one batch');
+        await this.ensureV2Collection(name, dim);
+        const points = items.map(item => {
+            const hash = typeof item.hash === 'string' ? parseInt(item.hash, 10) : item.hash;
+            if (!Number.isSafeInteger(hash)) throw new Error('[Qdrant] Invalid chunk hash');
+            const payload = this._payload({ ...item, hash }, {
+                type: tenant.type, sourceId: tenant.sourceId,
+                embeddingSource: embedding.embeddingSource, embeddingModel: embedding.embeddingModel,
+            });
+            delete payload.content_type;
+            payload.tenantKey = tenant.tenantKey;
+            payload.user = tenant.user;
+            return { id: this.v2PointId(tenant.tenantKey, hash), vector: item.vector, payload };
+        });
+        await this._request('PUT', `/collections/${name}/points?wait=true`, { points });
+    }
+
+    /** Exact number of points of one tenant. */
+    async countTenant(name, tenantKey, extraMust = []) {
+        const res = await this._request('POST', `/collections/${name}/points/count`, {
+            exact: true, filter: { must: [{ key: 'tenantKey', match: { value: tenantKey } }, ...extraMust] },
+        });
+        const count = res?.result?.count;
+        if (!Number.isSafeInteger(count) || count < 0) throw new Error(`Invalid Qdrant count for ${name}`);
+        return count;
+    }
+
+    /** Deletes this tenant's points for the given hashes (never another tenant's). */
+    async deleteV2(name, hashes, tenantKey) {
+        if (!this.baseUrl) throw new Error('Qdrant not initialized');
+        const list = hashes.map(h => typeof h === 'string' ? parseInt(h, 10) : h).filter(Number.isSafeInteger);
+        if (!list.length) return 0;
+        try {
+            for (let i = 0; i < list.length; i += 1000) {
+                await this._request('POST', `/collections/${name}/points/delete?wait=true`, {
+                    filter: { must: [
+                        { key: 'tenantKey', match: { value: tenantKey } },
+                        { key: 'hash', match: { any: list.slice(i, i + 1000) } },
+                    ] },
+                });
+            }
+        } catch (error) {
+            if (this._isNotFound(error)) return 0;
+            throw error;
+        }
+        return list.length;
+    }
+
+    /**
+     * Removes all of one tenant's points, confirms none remain, and empties the
+     * tenant's saved-settings slot (a tombstone, so a later first write can
+     * record new ones). The shared collection itself stays.
+     */
+    async purgeV2(name, tenantKey, configKey) {
+        if (!this.baseUrl) throw new Error('Qdrant not initialized');
+        try {
+            await this._request('POST', `/collections/${name}/points/delete?wait=true`, {
+                filter: { must: [{ key: 'tenantKey', match: { value: tenantKey } }] },
+            });
+        } catch (error) {
+            if (this._isNotFound(error)) return;
+            throw error;
+        }
+        const left = await this.countTenant(name, tenantKey);
+        if (left !== 0) throw new Error(`[Qdrant] Purge could not be confirmed: ${left} point(s) remain`);
+        if (configKey) {
+            const current = (await this._request('GET', `/collections/${name}`))?.result?.config?.metadata?.[configKey];
+            if (current !== undefined && !(current && current.vecthareTombstone === 1)) {
+                await this._request('PATCH', `/collections/${name}`, { metadata: { [configKey]: { vecthareTombstone: 1 } } });
+            }
+        }
+    }
+
+    /** v2 text/metadata edit: same point id for the same hash; a new hash gets a new point. */
+    async updateV2(name, hash, updates, tenant, embedding = {}) {
+        const existing = await this.getItem(name, hash, { tenantKey: tenant.tenantKey });
+        if (!existing) throw new Error(`Item with hash ${hash} not found`);
+        const newHash = updates.hash || hash;
+        const metadata = { ...existing.metadata, ...updates };
+        delete metadata.tenantKey; delete metadata.user;
+        await this.insertV2(name, [{ hash: newHash, text: updates.text || existing.text,
+            vector: updates.vector || existing.vector, metadata }], tenant, {
+            embeddingSource: embedding.embeddingSource ?? existing.metadata?.embeddingSource,
+            embeddingModel: embedding.embeddingModel ?? existing.metadata?.embeddingModel,
+        });
+        if (String(newHash) !== String(hash)) await this.deleteV2(name, [hash], tenant.tenantKey);
+    }
+
+    /** v2 collections (by name), for locating a tenant whose vector size is not known. */
+    async listV2CollectionNames() {
+        return (await this.listCollectionNames()).filter(name => MT_V2_NAME.test(name));
+    }
+
+    /** 9a: collection names; errors propagate (never "no collections"). */
+    async listCollectionNames() {
+        if (!this.baseUrl) throw new Error('Qdrant not initialized');
+        const collections = await this._request('GET', '/collections');
+        const names = collections?.result?.collections?.map(item => item?.name);
+        if (!Array.isArray(names) || names.some(name => typeof name !== 'string')) {
+            throw new Error('Qdrant returned no collection list');
+        }
+        return names;
     }
 
     async getCollections() {
@@ -1292,6 +1558,7 @@ class QdrantBackend {
             if (filters.sourceId) {
                 must.push({ key: 'sourceId', match: { value: filters.sourceId } });
             }
+            must.push(...this._extraScope(filters));
 
             const response = await this._request('POST', `/collections/${mainCollection}/points/scroll`, {
                 filter: { must },
@@ -1348,7 +1615,7 @@ class QdrantBackend {
         // Write the replacement first (a point's ID is its hash, so an upsert
         // replaces in place); remove the old hash only if it actually changed.
         await this.insertVectors(collectionName, [newItem], filters);
-        if (String(newHash) !== String(hash)) await this.deleteVectors(collectionName, [hash]);
+        if (String(newHash) !== String(hash)) await this.deleteVectors(collectionName, [hash], filters);
 
         console.log(`[Qdrant] Updated item ${hash} -> ${newHash}`);
     }

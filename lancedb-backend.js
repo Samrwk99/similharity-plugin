@@ -18,6 +18,7 @@
 
 import path from 'node:path';
 import fs from 'node:fs/promises';
+import { toSafeHashList, requireSafeHash } from './safe-values.js';
 // Load the LanceDB SDK only if this backend is selected.
 let lancedb;
 
@@ -38,7 +39,7 @@ function sanitizeTableName(collectionId) {
  * Singleton that manages LanceDB connections and operations
  * Organizes collections by embedding source (like ST's standard backend)
  */
-class LanceDBBackend {
+export class LanceDBBackend {
     constructor() {
         this.basePath = null;
         this.databases = new Map(); // Map source -> LanceDB connection
@@ -194,13 +195,18 @@ class LanceDBBackend {
             throw new Error(`[LanceDB] Vector dimension mismatch. Expected ${expectedDimension}, but found: ${examples}${mismatchedItems.length > 3 ? '...' : ''} (${mismatchedItems.length} total mismatches)`);
         }
 
-        // Format items for LanceDB
-        const records = validItems.map(item => ({
-            hash: item.hash,
-            text: item.text,
-            vector: item.vector,
-            metadata: JSON.stringify(item.metadata || {}),
-        }));
+        // Format items for LanceDB. One row per hash: if a batch repeats a
+        // hash the last occurrence wins (it is the one a keyed store would keep).
+        const byHash = new Map();
+        for (const item of validItems) {
+            byHash.set(requireSafeHash(item.hash), {
+                hash: item.hash,
+                text: item.text,
+                vector: item.vector,
+                metadata: JSON.stringify(item.metadata || {}),
+            });
+        }
+        const records = [...byHash.values()];
 
         // Check if collection exists
         let collection = await this.getCollection(collectionId, source);
@@ -214,9 +220,33 @@ class LanceDBBackend {
             this.collections.set(cacheKey, collection);
             console.log(`[LanceDB] Created collection: ${source}/${tableName} (${collectionId}) with ${items.length} vectors`);
         } else {
-            // Add to existing table
-            await collection.add(records);
-            console.log(`[LanceDB] Added ${items.length} vectors to ${source}/${tableName} (${collectionId})`);
+            // `add()` only appends, so a retry or a second sync used to store
+            // the same hash twice (inflated counts; one delete removed every
+            // copy). Replace instead: remove rows that already hold these
+            // hashes, then add, and put the old rows back if the add fails.
+            const hashList = records.map(r => requireSafeHash(r.hash));
+            const filter = `hash IN (${hashList.join(',')})`;
+            const previous = (await collection.query().where(filter)
+                .select(['hash', 'text', 'vector', 'metadata']).toArray())
+                .map(r => ({
+                    hash: Number(r.hash),
+                    text: r.text,
+                    vector: Array.from(r.vector),
+                    metadata: r.metadata,
+                }));
+            if (previous.length) await collection.delete(filter);
+            try {
+                await collection.add(records);
+            } catch (error) {
+                if (previous.length) {
+                    await collection.add(previous).catch(restoreError => {
+                        console.error('[LanceDB] Could not restore replaced rows:', restoreError.message);
+                    });
+                }
+                throw error;
+            }
+            console.log(`[LanceDB] Wrote ${records.length} vectors to ${source}/${tableName} ` +
+                `(${collectionId}), replacing ${previous.length} existing`);
         }
     }
 
@@ -346,7 +376,9 @@ class LanceDBBackend {
      */
     async deleteVectors(collectionId, hashes, source = 'transformers') {
         if (!this.basePath) throw new Error('LanceDB not initialized');
-        if (hashes.length === 0) return;
+        // Validate before anything else: one unsafe entry rejects the request.
+        const safeHashes = toSafeHashList(hashes);
+        if (safeHashes.length === 0) return;
 
         // Sanitize table name
         const tableName = sanitizeTableName(collectionId);
@@ -362,11 +394,11 @@ class LanceDBBackend {
         const collection = await this.getCollection(collectionId, source);
 
         // Delete by hash
-        const deleteFilter = `hash IN (${hashes.join(',')})`;
+        const deleteFilter = `hash IN (${safeHashes.join(',')})`;
 
         await collection.delete(deleteFilter);
 
-        console.log(`[LanceDB] Deleted ${hashes.length} items from ${source}/${collectionId}`);
+        console.log(`[LanceDB] Deleted ${safeHashes.length} items from ${source}/${collectionId}`);
     }
 
     /**
@@ -463,6 +495,7 @@ class LanceDBBackend {
      */
     async getItem(collectionId, hash, source = 'transformers') {
         if (!this.basePath) throw new Error('LanceDB not initialized');
+        const safeHash = requireSafeHash(hash);
 
         const tableName = sanitizeTableName(collectionId);
         const db = await this.getDatabase(source);
@@ -477,7 +510,7 @@ class LanceDBBackend {
         // Query for specific hash
         const results = await collection
             .query()
-            .where(`hash = ${hash}`)
+            .where(`hash = ${safeHash}`)
             .select(['hash', 'text', 'vector', 'metadata'])
             .toArray();
 
