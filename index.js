@@ -25,7 +25,7 @@ import {
     V2_CAPABILITY, MT_V2_NAME, tenantFor, configKeyForTenant, parseV2Storage, v2PhysicalName,
     milvusOwnName, mtV2Name, userHandle,
 } from './tenancy.js';
-import { copyCollection, deleteCopy } from './storage-move.js';
+import { copyCollection, deleteCopy, parseLocation } from './storage-move.js';
 import { isReservedSharedCollection } from './qdrant-backend.js';
 import milvusBackend, { ALL_TENANTS, parseMilvusTenant, normalizeMilvusTenant } from './milvus-backend.js';
 import { toSafeHashList, requireSafeHash, isSafeFilterString } from './safe-values.js';
@@ -151,6 +151,35 @@ export async function init(router) {
         return { scoped };
     }
 
+    // VH-054: after SillyTavern restarts, the shared Qdrant/Milvus clients are
+    // empty until someone calls /backend/init. A request that needs one brings
+    // back the last working connection (remembered at init, keys from the key
+    // store) instead of failing with "not initialized" until the page reloads.
+    const restoring = new Map();
+    const LISTS_EVERY_BACKEND = new Set(['/collections', '/storage/report', '/collections/paths']);
+    router.use(async (req, res, next) => {
+        try {
+            if (req.path.startsWith('/backend/init/')) return next();
+            const named = req.body?.backend ?? req.query?.backend;
+            const wanted = LISTS_EVERY_BACKEND.has(req.path) ? ['qdrant', 'milvus']
+                : (named === 'qdrant' || named === 'milvus') ? [named] : [];
+            for (const backend of wanted) {
+                if (isBackendReady(backend)) continue;
+                let pending = restoring.get(backend);
+                if (!pending) {
+                    pending = restoreServerConnection(req, backend)
+                        .catch(error => { console.warn(`[${pluginName}] Could not restore the ${backend} connection: ${error.message}`); return false; })
+                        .finally(() => restoring.delete(backend));
+                    restoring.set(backend, pending);
+                }
+                await pending;
+            }
+        } catch (error) {
+            console.warn(`[${pluginName}] Connection restore skipped: ${error.message}`);
+        }
+        next();
+    });
+
     router.use('/chunks', async (req, res, next) => {
         try {
             const isGet = req.method === 'GET';
@@ -169,11 +198,32 @@ export async function init(router) {
                 if (!isGet && req.body?.hashes !== undefined) toSafeHashList(req.body.hashes);
             }
 
+            // VH-015: on Qdrant older than 1.15 no collection can keep its saved
+            // settings; refuse writes up front instead of half-writing a collection.
+            if (backend === 'qdrant' && !isGet && req.path === '/insert' && qdrantBackend.supportsCollectionMetadata() === false) {
+                return res.status(409).json({ error: qdrantBackend.tooOldMessage(), code: 'qdrant_too_old' });
+            }
+
             // 9d (P8): a per-collection Qdrant store stamped with another user's
             // name is refused on a multi-user server (names are global there).
             if (backend === 'qdrant' && (storageRaw0(req, isGet) === undefined || storageRaw0(req, isGet) === null)) {
                 const denied = await qdrantOwnerDenied(req, source?.collectionId);
                 if (denied) return res.status(403).json({ error: denied });
+                // VH-004: remember who creates a new per-collection store, so it is theirs
+                // until its saved settings carry the owner stamp.
+                if (!isGet && req.path === '/insert' && typeof source?.collectionId === 'string' && qdrantBackend.baseUrl &&
+                    req.user?.profile?.admin !== true && await isMultiUserServer(req)) {
+                    const name = qdrantBackend._parseCollectionName(source.collectionId);
+                    if (!isReservedSharedCollection(name) && !await qdrantBackend.collectionExists(name).catch(() => true)) {
+                        await rememberCreator(req, `qdrant:${name}`);
+                    }
+                }
+                // VH-033: the old shared store has no user scope; reads by id (GET) cannot be scoped.
+                if (isGet && typeof source?.collectionId === 'string' &&
+                    qdrantBackend._parseCollectionName(source.collectionId) === 'vecthare_multitenancy' &&
+                    req.user?.profile?.admin !== true && await isMultiUserServer(req)) {
+                    return res.status(403).json({ error: 'On a multi-user server the older shared Qdrant store can only be read for one named collection' });
+                }
             }
 
             // 9c: a request naming a v2 storage layout (Qdrant/Milvus mt-v2,
@@ -210,7 +260,16 @@ export async function init(router) {
                 if (given !== undefined && fromFilter && given !== fromFilter) {
                     return res.status(400).json({ error: 'filter and filters name different collections' });
                 }
-                const scope = given ?? (req.path === '/delete' ? fromFilter : null);
+                // VH-033: on a multi-user server a non-admin must name the collection
+                // (any request, not only deletes), and must be its owner by evidence.
+                const restricted = req.user?.profile?.admin !== true && await isMultiUserServer(req);
+                const scope = given ?? ((req.path === '/delete' || restricted) ? fromFilter : null);
+                if (restricted) {
+                    const denied = await legacyOwnerDenied(req, scope || null);
+                    if (denied && !(scope && req.path !== '/insert' && await legacyMtScopeEmpty(scope))) {
+                        return res.status(403).json({ error: denied });
+                    }
+                }
                 if (scope) {
                     const base = req.body.filters && typeof req.body.filters === 'object' && !Array.isArray(req.body.filters)
                         ? req.body.filters : {};
@@ -226,6 +285,24 @@ export async function init(router) {
                 }
                 const { scoped, error } = resolveMilvusScope(raw);
                 if (error) return res.status(400).json({ error });
+                // VH-002: vecthare_main rows carry no user. Non-admins on a multi-user
+                // server need evidence; a tenant they create here is remembered as theirs.
+                if (req.user?.profile?.admin !== true && await isMultiUserServer(req)) {
+                    const logical = `vecthare_${scoped.type}_${scoped.sourceId}`;
+                    const creatorKey = `milvus:${logical}`;
+                    if (!isGet && req.path === '/insert' && milvusBackend.isConnected &&
+                        await milvusBackend.countItems({ type: scoped.type, sourceId: scoped.sourceId }).catch(() => 1) === 0) {
+                        await rememberCreator(req, creatorKey);
+                    }
+                    let denied = await legacyOwnerDenied(req, logical, creatorKey);
+                    const asSent = typeof raw?.tenantCollectionId === 'string' ? raw.tenantCollectionId : null;
+                    if (denied && asSent && asSent !== logical && !await legacyOwnerDenied(req, asSent, creatorKey)) denied = null;
+                    if (denied && req.path !== '/insert' &&
+                        await milvusBackend.countItems({ type: scoped.type, sourceId: scoped.sourceId }).catch(error => (/not exist|not found|not initialized/i.test(error?.message || '') ? 0 : 1)) === 0) {
+                        denied = null; // nothing stored for this tenant: nothing to protect
+                    }
+                    if (denied) return res.status(403).json({ error: denied });
+                }
                 // Everything downstream sees only the validated scope.
                 if (isGet) req.vecthareMilvusFilters = scoped;
                 else req.body.filters = scoped;
@@ -248,24 +325,128 @@ export async function init(router) {
         const key = ownerCacheKey(name);
         const hit = ownerCache.get(key);
         if (hit && hit.at > Date.now() - (hit.owner === undefined ? 5_000 : 60_000)) return hit.owner;
-        let owner;
-        try {
-            const record = await qdrantBackend.readInitialCollectionConfig(name,
-                `vecthare_initial_${createHash('sha256').update(name).digest('hex')}`);
-            owner = record && typeof record.owner === 'string' ? record.owner : undefined;
-        } catch { owner = undefined; }
+        // VH-003: a failed read is not "no stamp": it throws (and is not cached),
+        // so the guard fails closed instead of open.
+        const record = await qdrantBackend.readInitialCollectionConfig(name,
+            `vecthare_initial_${createHash('sha256').update(name).digest('hex')}`);
+        const owner = record && typeof record.owner === 'string' ? record.owner : undefined;
         ownerCache.set(key, { owner, at: Date.now() });
         return owner;
     }
+    // ------------------------------------------------------------------------
+    // Decision B (VH-002, VH-004, VH-033): stores from before per-user tenancy
+    // (unstamped per-collection Qdrant stores, the shared Qdrant
+    // vecthare_multitenancy store and Milvus vecthare_main) carry no user. On a
+    // multi-user server a non-admin may use such a collection only when the
+    // evidence names them: exactly one user's own collections.json lists the
+    // logical id, and it is theirs. Nobody or several -> admin only. A store a
+    // user creates through this plugin is remembered as theirs until its saved
+    // settings carry the owner stamp. Single-user servers are unaffected.
+    // ------------------------------------------------------------------------
+    const evidenceFileCache = new Map(); // filename -> { mtimeMs, size, ids }
+    async function idsListedIn(filename) {
+        let stat;
+        try { stat = await fs.stat(filename); } catch { return null; }
+        const hit = evidenceFileCache.get(filename);
+        if (hit && hit.mtimeMs === stat.mtimeMs && hit.size === stat.size) return hit.ids;
+        const current = await readOwnedStateFile(filename).catch(() => null);
+        if (current?.status !== 'found') { evidenceFileCache.delete(filename); return null; }
+        const ids = new Set();
+        const add = key => {
+            if (typeof key !== 'string') return;
+            ids.add(key);
+            const qualified = /^(?:[A-Za-z0-9_.-]+:){1,2}(vecthare_[A-Za-z0-9_.-]+)$/.exec(key);
+            if (qualified) ids.add(qualified[1]);
+        };
+        current.state.registry.forEach(add);
+        Object.keys(current.state.collections).forEach(add);
+        evidenceFileCache.set(filename, { mtimeMs: stat.mtimeMs, size: stat.size, ids });
+        return ids;
+    }
+    const dataRootOf = req => path.dirname(req.user.directories.root ?? path.dirname(req.user.directories.vectors));
+    async function evidenceOwners(req, logicalId) {
+        const owners = [];
+        let entries = [];
+        try { entries = await fs.readdir(dataRootOf(req), { withFileTypes: true }); } catch { return owners; }
+        for (const entry of entries) {
+            if (!entry.isDirectory() || entry.name.startsWith('_') || entry.name.startsWith('.')) continue;
+            const ids = await idsListedIn(path.join(dataRootOf(req), entry.name, 'vectors', OWNED_STATE_DIRECTORY, OWNED_STATE_FILE));
+            if (ids?.has(logicalId)) owners.push(entry.name);
+        }
+        return owners;
+    }
+
+    // Stores created through this plugin before their owner stamp exists.
+    const creatorsFile = req => path.join(dataRootOf(req), '_vecthare-server', 'store-creators.json');
+    let creatorsCache = null;
+    async function readCreators(req) {
+        if (creatorsCache) return creatorsCache;
+        try {
+            const parsed = JSON.parse(await fs.readFile(creatorsFile(req), 'utf8'));
+            creatorsCache = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+        } catch { creatorsCache = {}; }
+        return creatorsCache;
+    }
+    let creatorsWrite = Promise.resolve();
+    async function rememberCreator(req, key) {
+        const all = await readCreators(req);
+        if (all[key]) return;
+        all[key] = { by: userHandle(req), at: new Date().toISOString() };
+        const file = creatorsFile(req);
+        creatorsWrite = creatorsWrite.then(async () => {
+            await fs.mkdir(path.dirname(file), { recursive: true });
+            const temporary = `${file}.${randomUUID()}.tmp`;
+            await fs.writeFile(temporary, JSON.stringify(all, null, 2), { encoding: 'utf8', mode: 0o600 });
+            await fs.rename(temporary, file);
+        }).catch(error => console.warn(`[${pluginName}] Could not record a new store's creator: ${error.message}`));
+        await creatorsWrite;
+    }
+    const createdBy = async (req, key) => (await readCreators(req))[key]?.by;
+
+    // A collection with no rows (and no saved settings) in an old shared store has
+    // nothing to protect: probes for it (the locator, purge of all locations) may
+    // see "empty" instead of a refusal.
+    async function legacyMtScopeEmpty(contentType) {
+        try {
+            const r = await qdrantBackend._request('POST', '/collections/vecthare_multitenancy/points/count',
+                { exact: true, filter: { must: [{ key: 'content_type', match: { value: contentType } }] } });
+            return r?.result?.count === 0;
+        } catch (error) {
+            return error?.status === 404; // the shared store does not exist
+        }
+    }
+
+    /** @returns {Promise<string|null>} a refusal message, or null when allowed */
+    async function legacyOwnerDenied(req, logicalId, creatorKey = null) {
+        if (req.user?.profile?.admin === true || !await isMultiUserServer(req)) return null;
+        if (typeof logicalId !== 'string' || !logicalId) {
+            return 'On a multi-user server this older shared store can only be used for one named collection';
+        }
+        const owners = await evidenceOwners(req, logicalId);
+        if (owners.length === 1 && owners[0] === userHandle(req)) return null;
+        if (owners.length === 0 && creatorKey && await createdBy(req, creatorKey) === userHandle(req)) return null;
+        return owners.length > 1
+            ? 'This older collection is listed by several SillyTavern users; on a multi-user server only an admin can use it. Moving it to the new storage layout gives it an owner.'
+            : 'This older collection is not recorded as yours; on a multi-user server only its owner or an admin can use it. Moving it to the new storage layout gives it an owner.';
+    }
+
     /** @returns {Promise<string|null>} a refusal message, or null when allowed */
     async function qdrantOwnerDenied(req, collectionId) {
         if (typeof collectionId !== 'string' || !qdrantBackend.baseUrl) return null;
         const name = qdrantBackend._parseCollectionName(collectionId);
         if (isReservedSharedCollection(name)) return null; // shared stores are scoped otherwise
         if (req.user?.profile?.admin === true || !await isMultiUserServer(req)) return null;
-        const owner = await qdrantOwnerOf(name);
-        if (owner === undefined || owner === userHandle(req)) return null;
-        return 'This collection belongs to another SillyTavern user';
+        let owner;
+        try { owner = await qdrantOwnerOf(name); }
+        catch (error) { return `The owner of this collection could not be checked (${error.message}); try again`; }
+        if (owner === userHandle(req)) return null;
+        if (owner !== undefined) return 'This collection belongs to another SillyTavern user';
+        // VH-004: no owner stamp. A store that does not exist yet is created by
+        // this caller (remembered); an existing one needs evidence.
+        let exists = true;
+        try { exists = await qdrantBackend.collectionExists(name); } catch { exists = true; }
+        if (!exists) return null;
+        return legacyOwnerDenied(req, name, `qdrant:${name}`);
     }
 
     /**
@@ -408,6 +589,11 @@ export async function init(router) {
             type: 'milvus', v2: true,
             list: async (_c, _s, _m, _d, opts = {}) => {
                 if (!v.physical) return page([], opts);
+                if (opts.allHashes) {
+                    const hashes = await milvusBackend.listAllHashesV2(v.physical, tenantKey);
+                    return { items: hashes.map(hash => ({ hash })), total: hashes.length, offset: 0,
+                        limit: hashes.length, hasMore: false, complete: true };
+                }
                 const items = await milvusBackend.listV2(v.physical, tenantKey, opts);
                 const total = await milvusBackend.countV2(v.physical, tenantKey);
                 const offset = opts.offset || 0;
@@ -946,6 +1132,11 @@ export async function init(router) {
                     type: 'milvus',
 
                     list: async (collectionId, source, model, directories, options = {}) => {
+                        if (options.allHashes) {
+                            const hashes = await milvusBackend.listAllHashes(options.filters || {});
+                            return { items: hashes.map(hash => ({ hash })), total: hashes.length, offset: 0,
+                                limit: hashes.length, hasMore: false, complete: true };
+                        }
                         const items = await milvusBackend.listItems(collectionId, options.filters || {}, options);
                         const offset = options.offset || 0;
                         const limit = options.limit || items.length;
@@ -1016,7 +1207,8 @@ export async function init(router) {
                     },
 
                     purge: async (collectionId, source, model, directories, filters = {}) => {
-                        await milvusBackend.purgeCollection(collectionId, filters);
+                        // VH-011: reports how many shared rows had to stay.
+                        return await milvusBackend.purgeCollection(collectionId, filters);
                     },
 
                     stats: async (collectionId, source, model, directories, filters = {}) => {
@@ -1142,12 +1334,24 @@ export async function init(router) {
             if (!realFolder.startsWith(realRoot + path.sep)) {
                 return res.status(403).json({ error: 'Folder is outside the vectors directory' });
             }
+            // VH-060 (user decision a): a file manager opens on the machine that
+            // runs SillyTavern, so only for a request made on that machine, or by
+            // an admin. Anyone else (e.g. a remote user of a shared server) gets
+            // the path to look at instead. A request that came through a proxy
+            // (forwarding headers) is not treated as local even from 127.0.0.1.
+            const remote = String(req.socket?.remoteAddress || '');
+            const viaProxy = Boolean(req.headers?.['x-forwarded-for'] || req.headers?.['forwarded'] || req.headers?.['x-real-ip']);
+            const local = !viaProxy && (remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1');
+            if (!local && req.user?.profile?.admin !== true) {
+                return res.json({ success: true, opened: false, path: realFolder,
+                    reason: 'The folder is on the SillyTavern server, not on this device' });
+            }
             const platform = process.platform;
             const command = platform === 'win32' ? 'explorer.exe' : platform === 'darwin' ? 'open' : 'xdg-open';
             const child = spawn(command, [realFolder], { shell: false, detached: true, stdio: 'ignore' });
             child.on('error', error => console.warn(`[${pluginName}] Open folder failed:`, error.message));
             child.unref();
-            res.json({ success: true, path: realFolder });
+            res.json({ success: true, opened: true, path: realFolder });
 
         } catch (error) {
             console.error(`[${pluginName}] open-folder error:`, error);
@@ -1451,15 +1655,32 @@ export async function init(router) {
             throw error;
         }
         let state;
+        let migratedFrom = null;
         try {
             state = JSON.parse(raw);
+            // VH-063: a document from an earlier 13.3x build may lack top-level
+            // keys added later. Missing keys get their empty defaults (written
+            // back by the next save); wrong types are still refused.
+            if (isPlainObject(state)) {
+                const added = [];
+                if (state.version === undefined) { state.version = 1; added.push('version'); }
+                for (const [key, empty] of [['registry', []], ['collections', {}], ['chunkMetadata', {}], ['chatCollectionPolicies', {}]]) {
+                    if (state[key] === undefined) { state[key] = empty; added.push(key); }
+                }
+                if (state.chatCollectionBindings === undefined) {
+                    state.chatCollectionBindings = { version: 1, byCollection: {} }; added.push('chatCollectionBindings');
+                } else if (isPlainObject(state.chatCollectionBindings) && state.chatCollectionBindings.byCollection === undefined) {
+                    state.chatCollectionBindings.byCollection = {}; added.push('chatCollectionBindings.byCollection');
+                }
+                if (added.length) migratedFrom = added;
+            }
             validateOwnedState(state);
         } catch (error) {
             return { status: 'invalid', reason: error.message,
                 token: 'x' + createHash('sha256').update(raw).digest('hex').slice(0, 16) };
         }
         const revision = Number.isSafeInteger(state.revision) && state.revision >= 0 ? state.revision : 0;
-        return { status: 'found', state, revision, token: `r${revision}` };
+        return { status: 'found', state, revision, token: `r${revision}`, ...(migratedFrom ? { migratedFrom } : {}) };
     }
 
     router.post('/owned-state/read', async (req, res) => {
@@ -1468,7 +1689,7 @@ export async function init(router) {
             // A missing file is a fact the caller must be able to act on, and
             // unreadable content is never reported as an empty store.
             const current = await readOwnedStateFile(filename);
-            return res.json({ success: true, ...current });
+            return res.json({ success: true, ...current, serverNow: Date.now() }); // VH-065: the server's clock
         } catch (error) {
             console.error('[Similharity] Failed to read VectHare state:', error);
             return res.status(500).json({ error: error.message });
@@ -1479,7 +1700,7 @@ export async function init(router) {
         try {
             const { filename } = ownedStatePath(req);
             const current = await readOwnedStateFile(filename);
-            return res.json({ success: true, token: current.token });
+            return res.json({ success: true, token: current.token, serverNow: Date.now() });
         } catch (error) {
             return res.status(500).json({ error: error.message });
         }
@@ -1516,7 +1737,7 @@ export async function init(router) {
                 if (verification !== serialized) {
                     throw new Error('VectHare state verification failed after write');
                 }
-                return res.json({ success: true, verified: true, token: `r${revision}`,
+                return res.json({ success: true, verified: true, serverNow: Date.now(), token: `r${revision}`,
                     bytes: Buffer.byteLength(serialized, 'utf8') });
             });
         } catch (error) {
@@ -1747,9 +1968,16 @@ export async function init(router) {
                         physicalCollectionId !== 'vecthare_multitenancy') {
                         return res.status(400).json({ error: 'Invalid physical Qdrant collection name' });
                     }
+                    // VH-004/VH-033: nobody stamps a store that is not theirs.
+                    const denied = physicalCollectionId === 'vecthare_multitenancy'
+                        ? await legacyOwnerDenied(req, collectionId)
+                        : await qdrantOwnerDenied(req, physicalCollectionId);
+                    if (denied) return res.status(403).json({ error: denied });
                     saved = await qdrantBackend.saveInitialCollectionConfig(physicalCollectionId, key, record);
                     ownerCache.delete(ownerCacheKey(physicalCollectionId)); // its stamp is known now
                 } else {
+                    const denied = await legacyOwnerDenied(req, collectionId, `milvus:${collectionId}`);
+                    if (denied) return res.status(403).json({ error: denied });
                     saved = await milvusBackend.saveInitialCollectionConfig(key, record);
                 }
             } else if (['standard', 'vectra', 'lancedb'].includes(backend)) {
@@ -1860,6 +2088,9 @@ export async function init(router) {
                 if (physical !== collectionId) {
                     return unverified('A shared Qdrant collection cannot confirm one logical collection');
                 }
+                // VH-004: existence and counts of another user's store are not reported.
+                const denied = await qdrantOwnerDenied(req, physical);
+                if (denied) return unverified(denied);
                 try {
                     const present = await qdrantBackend.collectionExists(physical);
                     if (!present) return res.json({ success: true, existence: 'absent' });
@@ -1892,6 +2123,17 @@ export async function init(router) {
                     const tenant = parseMilvusTenant(collectionId);
                     if (!tenant) {
                         return unverified('This collection id cannot be mapped to a Milvus collection identity');
+                    }
+                    const denied = await legacyOwnerDenied(req, collectionId, `milvus:${collectionId}`);
+                    if (denied) return unverified(denied);
+                    // VH-011: right after a delete, rows that had to stay because
+                    // another collection stores the same text do not count: the
+                    // collection is gone once nothing else of it remains.
+                    if (req.body?.afterDelete === true) {
+                        const { unshared, shared } = await milvusBackend.countUnsharedItems(tenant);
+                        return unshared > 0
+                            ? res.json({ success: true, existence: 'present', count: unshared + shared, countTrusted: true })
+                            : res.json({ success: true, existence: 'absent', ...(shared ? { sharedLeftover: shared } : {}) });
                     }
                     const rows = await milvusBackend.countItems(tenant);
                     // A shared store cannot prove absence, so zero rows stays unverified.
@@ -2014,14 +2256,19 @@ export async function init(router) {
                         physicalCollectionId !== 'vecthare_multitenancy') {
                         return res.status(400).json({ error: 'Invalid physical Qdrant collection name' });
                     }
-                    const denied = await qdrantOwnerDenied(req, physicalCollectionId);
-                    if (denied) return res.status(403).json({ error: denied });
+                    const denied = physicalCollectionId === 'vecthare_multitenancy'
+                        ? await legacyOwnerDenied(req, collectionId)
+                        : await qdrantOwnerDenied(req, physicalCollectionId);
                     record = await qdrantBackend.readInitialCollectionConfig(physicalCollectionId, key);
+                    // A record that does not exist reveals nothing; one that does is the owner's.
+                    if (denied && record !== undefined) return res.status(403).json({ error: denied });
                 } else {
                     if (physicalCollectionId !== 'vecthare_main') {
                         return res.status(400).json({ error: 'Invalid physical Milvus collection name' });
                     }
+                    const denied = await legacyOwnerDenied(req, collectionId, `milvus:${collectionId}`);
                     record = await milvusBackend.readInitialCollectionConfig(key);
+                    if (denied && record !== undefined) return res.status(403).json({ error: denied });
                     if (record !== undefined) {
                         try { record = JSON.parse(record); }
                         catch { return res.json({ success: true, status: 'invalid' }); }
@@ -2130,7 +2377,19 @@ export async function init(router) {
             return res.json({ success: true, status: 'found', record });
         } catch (error) {
             console.error(`[${pluginName}] Could not read initial collection configuration:`, error);
-            res.status(503).json({ error: 'Collection configuration unavailable' });
+            // VH-080: say why, so "unavailable" does not hide a refused API key.
+            // A backend that could not connect (e.g. after a restart with a wrong
+            // key) answers "not initialized"; its last connection attempt says why.
+            const last = lastInitFailure[String(req.body?.backend || '')];
+            const notConnected = /not initialized|not connected/i.test(String(error?.message || ''));
+            const backendStatus = Number(error?.status) || (notConnected ? Number(last?.status) : NaN);
+            const credentials = backendStatus === 401 || backendStatus === 403 ||
+                /unauthenticated|authentication|invalid api key|permission denied|access denied/i.test(
+                    String(error?.message || '') + (notConnected ? ` ${last?.message || ''}` : ''));
+            res.status(503).json({ error: 'Collection configuration unavailable',
+                ...(Number.isInteger(backendStatus) ? { backendStatus } : {}),
+                ...(credentials ? { credentials: true } : {}),
+                backend: String(req.body?.backend || '') });
         }
     });
 
@@ -2153,6 +2412,13 @@ export async function init(router) {
                 const denied = await qdrantOwnerDenied(req, collectionId);
                 if (denied) return res.status(403).json({ error: denied });
             }
+            // VH-002/VH-033: moving or deleting out of an older shared store needs evidence too.
+            const touchesShared = backend === 'milvus' ||
+                [req.body?.from?.layout, req.body?.location?.layout].includes('legacy-mt');
+            if (touchesShared) {
+                const denied = await legacyOwnerDenied(req, collectionId, `${backend}:${collectionId}`);
+                if (denied) return res.status(403).json({ error: denied });
+            }
             const ctx = { qdrant: qdrantBackend, milvus: milvusBackend };
             if (action === 'copy') {
                 const result = await copyCollection(ctx, { backend, collectionId, tenant,
@@ -2170,10 +2436,27 @@ export async function init(router) {
                 }
                 const locator = collectRecordedCollections(current.state).get(collectionId)?.locator;
                 const loc = req.body.location;
-                if (!locator || (locator.backend === backend && locator.physical === loc?.physical && locator.layout === loc?.layout)) {
-                    return res.status(409).json({ error: locator
-                        ? 'That is where the collection is stored now; it is not an old copy. Nothing was deleted.'
-                        : 'Where this collection is stored now is not recorded; nothing was deleted.' });
+                if (!locator) {
+                    return res.status(409).json({ error: 'Where this collection is stored now is not recorded; nothing was deleted.' });
+                }
+                // VH-005: compare what would really be deleted (the normalised location),
+                // not the raw request; a physical name that the layout ignores is refused.
+                let target;
+                try { target = parseLocation(backend, collectionId, tenant.tenantKey, loc); }
+                catch (error) { return res.status(400).json({ error: error.message }); }
+                if (loc?.physical != null && loc.physical !== target.physical) {
+                    return res.status(400).json({ error: 'The location names a different store than its layout; nothing was deleted.' });
+                }
+                let currentTarget = null;
+                if (locator.backend === backend) {
+                    try { currentTarget = parseLocation(backend, collectionId, tenant.tenantKey, locator); } catch { currentTarget = null; }
+                }
+                const isCurrent = locator.backend === backend && (
+                    (currentTarget && currentTarget.layout === target.layout && currentTarget.physical === target.physical) ||
+                    (locator.layout === target.layout && locator.physical === target.physical) ||
+                    (!currentTarget && locator.layout === target.layout)); // unparseable record: fail closed per layout
+                if (isCurrent) {
+                    return res.status(409).json({ error: 'That is where the collection is stored now; it is not an old copy. Nothing was deleted.' });
                 }
                 return res.json({ success: true, ...await deleteCopy(ctx, { backend, collectionId, tenant, locationRaw: loc }) });
             }
@@ -2233,13 +2516,33 @@ export async function init(router) {
             // listed only to their owner (by the stamp in their saved settings);
             // unstamped (older) ones only to an admin.
             const restrict = req.user?.profile?.admin !== true && await isMultiUserServer(req);
-            const allCollections = await scanAllSourcesForCollections(vectorsPath,
-                restrict ? { ownerOf: qdrantOwnerOf, handle: userHandle(req) } : null);
+            // VH-003: an owner that cannot be read hides the store (never shows it);
+            // VH-004: an unstamped store is listed to its owner by evidence.
+            const handle = userHandle(req);
+            // An owner that cannot be read throws: the store is hidden and the
+            // Qdrant listing is reported incomplete (VH-008).
+            const allowed = async name => {
+                const owner = await qdrantOwnerOf(name);
+                if (owner !== undefined) return owner === handle;
+                return !await legacyOwnerDenied(req, name, `qdrant:${name}`);
+            };
+            const scan = await scanAllSourcesForCollections(vectorsPath,
+                restrict ? { ownerOf: qdrantOwnerOf, handle, allowed } : null);
+            // VH-085: this user's collections inside the shared v2 stores (Qdrant
+            // or Milvus multitenancy, new layout) and Milvus per-collection
+            // stores, with the store they live in, so they can be found again
+            // without collections.json (e.g. after Start fresh).
+            const v2 = await listV2TenantCollections(req);
+            scan.collections.push(...v2.collections);
+            for (const backend of v2.incomplete) if (!scan.incomplete.includes(backend)) scan.incomplete.push(backend);
 
             res.json({
                 success: true,
-                count: allCollections.length,
-                collections: allCollections
+                count: scan.collections.length,
+                collections: scan.collections,
+                // VH-008: backends whose listing may be missing collections.
+                inventoryReport: 1,
+                incompleteBackends: scan.incomplete,
             });
         } catch (error) {
             console.error(`[${pluginName}] collections error:`, error);
@@ -2338,6 +2641,7 @@ export async function init(router) {
                 case 'qdrant':
                     healthy = await qdrantBackend.healthCheck();
                     message = healthy ? 'Qdrant connected' : 'Qdrant not available';
+                    if (healthy && qdrantBackend.supportsCollectionMetadata() === false) message = qdrantBackend.tooOldMessage();
                     break;
 
                 case 'milvus':
@@ -2349,7 +2653,8 @@ export async function init(router) {
                     return res.status(400).json({ error: `Unknown backend: ${backend}` });
             }
 
-            res.json({ backend, healthy, message });
+            res.json({ backend, healthy, message,
+                ...(backend === 'qdrant' ? { version: qdrantBackend.serverVersion || null, writable: qdrantBackend.supportsCollectionMetadata() !== false } : {}) });
 
         } catch (error) {
             console.error(`[${pluginName}] backend/health error:`, error);
@@ -2357,14 +2662,101 @@ export async function init(router) {
         }
     });
 
+    // VH-001: one Qdrant/Milvus connection serves every user of this SillyTavern
+    // server. On a multi-user server only an admin may set it; other users get the
+    // admin's connection (their own address settings are not used). The admin's
+    // last working target (no keys; the key is read from the admin's key store)
+    // is remembered so the connection can come back after a server restart even
+    // when a non-admin is the first to use it.
+    const SHARED_BACKENDS = new Set(['qdrant', 'milvus']);
+    const serverStateFile = req => path.join(
+        path.dirname(req.user.directories.root ?? path.dirname(req.user.directories.vectors)),
+        '_vecthare-server', 'backend-connections.json');
+    const backendFor = name => name === 'qdrant' ? qdrantBackend : milvusBackend;
+    const isBackendReady = name => name === 'qdrant' ? Boolean(qdrantBackend.baseUrl) : Boolean(milvusBackend.isConnected && milvusBackend.client);
+
+    async function readServerConnections(req) {
+        try {
+            const parsed = JSON.parse(await fs.readFile(serverStateFile(req), 'utf8'));
+            return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+        } catch {
+            return {};
+        }
+    }
+
+    async function rememberServerConnection(req, backend, config) {
+        const target = backend === 'qdrant'
+            ? { url: config.url || null, host: config.host || null, port: config.port || null }
+            : { address: config.address || null, ssl: config.ssl === true, username: config.username || null, dimensions: config.dimensions ?? null };
+        const record = { target, keyStore: secretsPath(req).filename, by: req.user?.profile?.handle || null, at: new Date().toISOString() };
+        const file = serverStateFile(req);
+        try {
+            const all = await readServerConnections(req);
+            all[backend] = record;
+            await fs.mkdir(path.dirname(file), { recursive: true });
+            const temporary = `${file}.${randomUUID()}.tmp`;
+            await fs.writeFile(temporary, JSON.stringify(all, null, 2), { encoding: 'utf8', mode: 0o600 });
+            await fs.rename(temporary, file);
+        } catch (error) {
+            console.warn(`[${pluginName}] Could not remember the ${backend} connection: ${error.message}`);
+        }
+    }
+
+    async function restoreServerConnection(req, backend) {
+        const record = (await readServerConnections(req))[backend];
+        if (!record?.target) return false;
+        let secrets = {};
+        try {
+            const parsed = JSON.parse(await fs.readFile(record.keyStore, 'utf8'));
+            if (parsed && typeof parsed === 'object') secrets = parsed;
+        } catch { /* no key store: connect without a key */ }
+        const config = { ...record.target };
+        if (backend === 'qdrant') {
+            if (typeof secrets.qdrant_api_key === 'string' && secrets.qdrant_api_key && config.url) config.apiKey = secrets.qdrant_api_key;
+        } else if (typeof secrets.milvus_token === 'string' && secrets.milvus_token) {
+            config.token = secrets.milvus_token;
+        } else if (config.username && typeof secrets.milvus_password === 'string' && secrets.milvus_password) {
+            config.token = `${config.username}:${secrets.milvus_password}`;
+        }
+        await backendFor(backend).initialize(config);
+        console.log(`[${pluginName}] ${backend} connection restored from the admin's last setup`);
+        return true;
+    }
+
+    const sharedBackendRestricted = async req => req.user?.profile?.admin !== true && await isMultiUserServer(req);
+
     /**
      * POST /api/plugins/similharity/backend/init/:backend
      * Initialize specific backend
      */
+    // VH-080: why the last connection attempt per backend failed (cleared on success).
+    const lastInitFailure = {};
+
     router.post('/backend/init/:backend', async (req, res) => {
         try {
             const { backend } = req.params;
             const config = req.body;
+
+            if (SHARED_BACKENDS.has(backend) && await sharedBackendRestricted(req)) {
+                if (!isBackendReady(backend)) {
+                    try {
+                        await restoreServerConnection(req, backend);
+                    } catch (error) {
+                        return res.status(503).json({
+                            error: `The ${backend} connection set up by the server admin is not reachable: ${error.message}`,
+                            code: 'admin_connection_unavailable',
+                        });
+                    }
+                }
+                if (!isBackendReady(backend)) {
+                    return res.status(403).json({
+                        error: `On a multi-user SillyTavern server only an admin can set up the ${backend === 'qdrant' ? 'Qdrant' : 'Milvus'} connection. Ask an admin to open SillyTavern with VectHare once.`,
+                        code: 'admin_required',
+                    });
+                }
+                return res.json({ success: true, managedByAdmin: true, message: `${backend} connection is managed by the server admin`,
+                    ...(backend === 'qdrant' && qdrantBackend.supportsCollectionMetadata() === false ? { warning: qdrantBackend.tooOldMessage() } : {}) });
+            }
 
             switch (backend) {
                 case 'vectra':
@@ -2379,11 +2771,16 @@ export async function init(router) {
 
                 case 'qdrant':
                     await qdrantBackend.initialize(await applyStoredSecrets(req, 'qdrant', config));
-                    res.json({ success: true, message: 'Qdrant initialized' });
+                    await rememberServerConnection(req, 'qdrant', config || {});
+                    delete lastInitFailure.qdrant; // VH-080
+                    res.json({ success: true, message: 'Qdrant initialized', version: qdrantBackend.serverVersion || null,
+                        ...(qdrantBackend.supportsCollectionMetadata() === false ? { warning: qdrantBackend.tooOldMessage() } : {}) });
                     break;
 
                 case 'milvus':
                     await milvusBackend.initialize(await applyStoredSecrets(req, 'milvus', config));
+                    await rememberServerConnection(req, 'milvus', config || {});
+                    delete lastInitFailure.milvus; // VH-080
                     res.json({ success: true, message: 'Milvus initialized' });
                     break;
 
@@ -2393,6 +2790,8 @@ export async function init(router) {
 
         } catch (error) {
             console.error(`[${pluginName}] backend/init error:`, error);
+            // VH-080: remembered, so later "not initialized" answers can say why.
+            lastInitFailure[String(req.params.backend || '')] = { status: Number(error?.status) || null, message: String(error?.message || '') };
             res.status(500).json({ error: error.message });
         }
     });
@@ -2431,10 +2830,35 @@ async function isMultiUserServer(req) {
     return value;
 }
 
+/** VH-066: the eight 16-bit groups of an IPv6 address, or null. */
+function ipv6Groups(address) {
+    let text = String(address).toLowerCase().split('%')[0];
+    const dotted = /(\d+\.\d+\.\d+\.\d+)$/.exec(text);
+    if (dotted) {
+        const parts = dotted[1].split('.').map(Number);
+        if (parts.some(n => n > 255)) return null;
+        text = text.slice(0, -dotted[1].length) + ((parts[0] << 8) | parts[1]).toString(16) + ':' + ((parts[2] << 8) | parts[3]).toString(16);
+    }
+    const halves = text.split('::');
+    if (halves.length > 2) return null;
+    const head = halves[0] ? halves[0].split(':') : [];
+    const tail = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
+    const fill = halves.length === 2 ? 8 - head.length - tail.length : 0;
+    const groups = [...head, ...Array(Math.max(fill, 0)).fill('0'), ...tail].map(g => parseInt(g || '0', 16));
+    return groups.length === 8 && groups.every(g => Number.isInteger(g) && g >= 0 && g <= 0xffff) ? groups : null;
+}
+
 function isPrivateAddress(address) {
     let ip = address;
-    const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(ip);
-    if (mapped) ip = mapped[1];
+    // VH-066: IPv4 inside IPv6 (::ffff:a.b.c.d in any spelling, ::a.b.c.d, 64:ff9b::/96)
+    // is judged as the IPv4 address it reaches.
+    if (net.isIPv6(ip)) {
+        const g = ipv6Groups(ip);
+        if (!g) return true;
+        const embedded = (g[0] === 0 && g[1] === 0 && g[2] === 0 && g[3] === 0 && g[4] === 0 && (g[5] === 0xffff || g[5] === 0) &&
+            !(g[5] === 0 && g[6] === 0 && g[7] <= 1)) || (g[0] === 0x64 && g[1] === 0xff9b && g.slice(2, 6).every(x => x === 0));
+        if (embedded) ip = `${g[6] >> 8}.${g[6] & 255}.${g[7] >> 8}.${g[7] & 255}`;
+    }
     if (net.isIPv4(ip)) {
         const [a, b] = ip.split('.').map(Number);
         return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) ||
@@ -2455,8 +2879,8 @@ function isPrivateAddress(address) {
  * @param {URL} url
  */
 async function assertOutboundUrlAllowed(req, url) {
-    if (!(await isMultiUserServer(req))) return;
-    if (['1', 'true', 'yes'].includes(String(process.env.SIMILHARITY_ALLOW_PRIVATE_URLS || '').toLowerCase())) return;
+    if (!(await isMultiUserServer(req))) return {};
+    if (['1', 'true', 'yes'].includes(String(process.env.SIMILHARITY_ALLOW_PRIVATE_URLS || '').toLowerCase())) return {};
     if (url.protocol !== 'http:' && url.protocol !== 'https:') {
         throw new Error('Blocked: only http(s) URLs are allowed on a multi-user server');
     }
@@ -2475,6 +2899,20 @@ async function assertOutboundUrlAllowed(req, url) {
         throw new Error('Blocked: this server has several SillyTavern users, so loopback/private-network URLs are not allowed. ' +
             'The server admin can allow them by setting SIMILHARITY_ALLOW_PRIVATE_URLS=1.');
     }
+    // VH-036: a checked URL must not be redirected somewhere unchecked.
+    return { redirect: 'manual' };
+}
+
+function parseProviderUrl(label, apiUrl) {
+    try { return new URL(String(apiUrl)); } catch (e) { throw new Error(`${label}: Invalid URL format "${apiUrl}" - ${e.message}`); }
+}
+
+/** VH-036: a guarded request answered with a redirect is refused. */
+function refuseRedirect(response) {
+    if (response.type === 'opaqueredirect' || (response.status >= 300 && response.status < 400)) {
+        throw new Error('Blocked: the embedding server answered with a redirect, which is not followed on a multi-user server');
+    }
+    return response;
 }
 
 /**
@@ -2499,7 +2937,7 @@ async function getVectorsForSource(source, texts, model, directories, req, isQue
         } catch (e) {
             throw new Error(`BananaBread: Invalid URL format "${apiUrl}" - ${e.message}`);
         }
-        await assertOutboundUrlAllowed(req, url);
+        const guard = await assertOutboundUrlAllowed(req, url);
 
         const headers = { 'Content-Type': 'application/json' };
         if (apiKey) {
@@ -2514,11 +2952,13 @@ async function getVectorsForSource(source, texts, model, directories, req, isQue
                 const batchTexts = texts.slice(i, i + BATCH_SIZE);
                 // console.log(`[BananaBread] Processing batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(texts.length / BATCH_SIZE)} (${batchTexts.length} items)`);
 
-                const response = await fetch(url.toString(), {
+                const response = refuseRedirect(await fetch(url.toString(), {
                     method: 'POST',
                     headers: headers,
                     body: JSON.stringify({ content: batchTexts }),
-                });
+                    signal: AbortSignal.timeout(120_000), // VH-019: never wait forever
+                    ...guard,
+                }));
 
                 if (!response.ok) {
                     const errorText = await response.text();
@@ -2597,16 +3037,18 @@ async function _getKoboldCppEmbedding(text, model, req) {
     } catch (e) {
         throw new Error(`KoboldCpp: Invalid URL format "${apiUrl}" - ${e.message}`);
     }
-    await assertOutboundUrlAllowed(req, url);
+    const guard = await assertOutboundUrlAllowed(req, url);
 
-    const response = await fetch(url.toString(), {
+    const response = refuseRedirect(await fetch(url.toString(), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: AbortSignal.timeout(120_000), // VH-019: never wait forever
+        ...guard,
         body: JSON.stringify({
             input: text,
             model: model || 'koboldcpp',
         }),
-    });
+    }));
 
     if (!response.ok) {
         const errorText = await response.text();
@@ -2661,12 +3103,14 @@ async function _getLegacySingleEmbedding(source, text, model, directories, req, 
         case 'ollama': {
             const { getOllamaVector } = await import('../../src/vectors/ollama-vectors.js');
             const apiUrl = req.body?.apiUrl || 'http://localhost:11434';
+            await assertOutboundUrlAllowed(req, parseProviderUrl('Ollama', apiUrl)); // VH-036
             const keep = req.body?.keep || false;
             return await getOllamaVector(text, apiUrl, model, keep, directories);
         }
         case 'llamacpp': {
             const { getLlamaCppVector } = await import('../../src/vectors/llamacpp-vectors.js');
             const apiUrl = req.body?.apiUrl || 'http://localhost:8080';
+            await assertOutboundUrlAllowed(req, parseProviderUrl('llama.cpp', apiUrl)); // VH-036
             return await getLlamaCppVector(text, apiUrl, directories);
         }
         case 'bananabread': {
@@ -2676,6 +3120,7 @@ async function _getLegacySingleEmbedding(source, text, model, directories, req, 
         case 'vllm': {
             const { getVllmVector } = await import('../../src/vectors/vllm-vectors.js');
             const apiUrl = req.body?.apiUrl || 'http://localhost:8000';
+            await assertOutboundUrlAllowed(req, parseProviderUrl('vLLM', apiUrl)); // VH-036
             return await getVllmVector(text, apiUrl, model, directories);
         }
         case 'palm':
@@ -2690,6 +3135,7 @@ async function _getLegacySingleEmbedding(source, text, model, directories, req, 
         case 'extras': {
             const { getExtrasVector } = await import('../../src/vectors/extras-vectors.js');
             const extrasUrl = req.body?.extrasUrl || 'http://localhost:5100';
+            await assertOutboundUrlAllowed(req, parseProviderUrl('Extras', extrasUrl)); // VH-036 (Pass 19)
             const extrasKey = req.body?.extrasKey || '';
             return await getExtrasVector(text, extrasUrl, extrasKey);
         }
@@ -2719,6 +3165,7 @@ async function _getLegacySingleEmbedding(source, text, model, directories, req, 
                 includeVectors = false,
                 hashesOnly = false,
                 strictRead = false,
+                allHashes = false,
                 filters = {}
             } = req.body;
 
@@ -2732,14 +3179,23 @@ async function _getLegacySingleEmbedding(source, text, model, directories, req, 
             }
 
             const handler = req.vh2 ? getV2Handler(req) : getBackendHandler(backend);
+            // VH-027: allHashes asks for every hash of the collection, with
+            // `complete: true` only when the reply is known to hold all of them.
+            const wantAll = allHashes === true;
             const result = await handler.list(collectionId, source, model, req.user.directories, {
-                offset,
-                limit,
-                includeVectors,
-                hashesOnly,
-                strictRead: strictRead === true,
+                offset: wantAll ? 0 : offset,
+                limit: wantAll ? Number.MAX_SAFE_INTEGER : limit,
+                includeVectors: wantAll ? false : includeVectors,
+                hashesOnly: wantAll || hashesOnly,
+                strictRead: wantAll || strictRead === true,
+                allHashes: wantAll,
                 filters
             });
+            if (wantAll) {
+                result.items = (result.items || []).map(item => ({ hash: item.hash }));
+                result.complete = result.complete === true ||
+                    (result.hasMore === false && Number(result.total) === result.items.length);
+            }
 
             res.json({
                 success: true,
@@ -3268,7 +3724,7 @@ async function _getLegacySingleEmbedding(source, text, model, directories, req, 
             }
 
             const handler = req.vh2 ? getV2Handler(req) : getBackendHandler(backend);
-            await handler.purge(collectionId, source, model, req.user.directories, filters);
+            const purged = await handler.purge(collectionId, source, model, req.user.directories, filters);
             // Purge invalidates only VectHare-owned identity records. No ST
             // chat file, settings file or vanilla vector index is touched.
             // Only a whole-collection purge drops the ledger. A filtered purge leaves the
@@ -3297,7 +3753,10 @@ async function _getLegacySingleEmbedding(source, text, model, directories, req, 
                 success: true,
                 backend: handler.type,
                 collectionId,
-                message: `Collection ${collectionId} purged`
+                message: `Collection ${collectionId} purged`,
+                // VH-011: Milvus' older shared store - rows whose text another
+                // collection also stores, left in place.
+                ...(Number(purged?.leftShared) > 0 ? { leftShared: Number(purged.leftShared) } : {}),
             });
 
         } catch (error) {
@@ -3333,7 +3792,7 @@ async function _getLegacySingleEmbedding(source, text, model, directories, req, 
 
             const url = new URL(apiUrl);
             url.pathname = '/v1/rerank';
-            await assertOutboundUrlAllowed(req, url);
+            const guard = await assertOutboundUrlAllowed(req, url);
 
             // Default task description if not provided
             const finalTaskDescription = task_description || "Given the following document from a role play, which of the following documents are most relevant to it?";
@@ -3343,9 +3802,11 @@ async function _getLegacySingleEmbedding(source, text, model, directories, req, 
                 headers['Authorization'] = `Bearer ${apiKey}`;
             }
 
-            const response = await fetch(url.toString(), {
+            const response = refuseRedirect(await fetch(url.toString(), {
                 method: 'POST',
                 headers: headers,
+                ...guard,
+                signal: AbortSignal.timeout(60_000), // VH-019
                 body: JSON.stringify({
                     query,
                     documents,
@@ -3353,7 +3814,7 @@ async function _getLegacySingleEmbedding(source, text, model, directories, req, 
                     return_documents: false,
                     task_description: finalTaskDescription
                 }),
-            });
+            }));
 
             if (!response.ok) {
                 const errorText = await response.text();
@@ -3434,14 +3895,24 @@ async function getIndex(directories, collectionId, source, model) {
 /**
  * Simple string hash function
  */
-function getStringHash(str) {
-    let hash = 0;
-    for (let i = 0; i < str.length; i++) {
-        const char = str.charCodeAt(i);
-        hash = ((hash << 5) - hash) + char;
-        hash = hash & hash;
+/**
+ * VH-034: the same 53-bit hash SillyTavern's getStringHash() computes (cyrb53),
+ * which VectHare uses for every chunk. The plugin used a different 32-bit hash
+ * here, so a text edit through the plugin filed the chunk under a hash nothing
+ * else computes.
+ */
+function getStringHash(str, seed = 0) {
+    if (typeof str !== 'string') return 0;
+    let h1 = 0xdeadbeef ^ seed;
+    let h2 = 0x41c6ce57 ^ seed;
+    for (let i = 0, ch; i < str.length; i++) {
+        ch = str.charCodeAt(i);
+        h1 = Math.imul(h1 ^ ch, 2654435761);
+        h2 = Math.imul(h2 ^ ch, 1597334677);
     }
-    return Math.abs(hash);
+    h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+    h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+    return 4294967296 * (2097151 & h2) + (h1 >>> 0);
 }
 
 /**
@@ -3449,10 +3920,13 @@ function getStringHash(str) {
  */
 async function scanAllSourcesForCollections(vectorsPath, ownerFilter = null) {
     const allCollections = [];
+    // VH-008: backends whose listing may be missing collections (a read failed,
+    // or the listing was filtered). The extension never prunes those.
+    const incomplete = new Set();
 
     try {
         // Scan vectra indexes
-        const vectraIndexes = await findAllIndexes(vectorsPath);
+        const vectraIndexes = await findAllIndexes(vectorsPath, '', () => incomplete.add('vectra'));
 
         const vectraCollectionMap = new Map();
         for (const index of vectraIndexes) {
@@ -3468,7 +3942,8 @@ async function scanAllSourcesForCollections(vectorsPath, ownerFilter = null) {
                 });
             }
 
-            const chunkCount = await getChunkCountFromIndex(index.indexPath);
+            let chunkCount = await getChunkCountFromIndex(index.indexPath);
+            if (chunkCount === null) { incomplete.add('vectra'); chunkCount = 0; }
             vectraCollectionMap.get(key).indexes.push({
                 modelPath: index.modelPath,
                 chunkCount: chunkCount
@@ -3502,8 +3977,10 @@ async function scanAllSourcesForCollections(vectorsPath, ownerFilter = null) {
 
         // Scan LanceDB
         const lancedbPath = path.join(vectorsPath, 'lancedb');
+        let lancedbFolder = false;
         try {
             await fs.access(lancedbPath);
+            lancedbFolder = true;
             const lancedbInstance = await lanceFor({ vectors: vectorsPath });
 
             const sourceDirs = await fs.readdir(lancedbPath, { withFileTypes: true });
@@ -3528,33 +4005,38 @@ async function scanAllSourcesForCollections(vectorsPath, ownerFilter = null) {
                                 modelCount: 1
                             });
                         } catch (e) {
+                            incomplete.add('lancedb');
                             console.warn(`[${pluginName}] LanceDB: Failed to open table '${tableName}' in source '${source}':`, e.message);
                         }
                     }
                 } catch (e) {
+                    incomplete.add('lancedb');
                     console.warn(`[${pluginName}] LanceDB: Failed to scan source '${source}':`, e.message);
                 }
             }
         } catch (e) {
             // LanceDB folder doesn't exist - this is normal if LanceDB hasn't been used
+            if (lancedbFolder) incomplete.add('lancedb');
             console.debug(`[${pluginName}] LanceDB folder not found or not accessible:`, e.message);
         }
 
         // Scan Qdrant (uses REST API, so check if initialized via baseUrl)
+        // VH-008: each store is read on its own; a failure, an unreachable server
+        // or an owner check that could not be made marks the listing incomplete.
         try {
-            if (qdrantBackend.baseUrl) {
-                const healthy = await qdrantBackend.healthCheck();
-                if (healthy) {
-                    // List items from vecthare_main collection
-                    const collections = await qdrantBackend.getCollections();
-                    const hasVecthareMain = collections.some(col => col.name === 'vecthare_main'); //just-in-case support for multitenancy?
-
-                    for (const collectionName of collections) {
-                        // 9c: a v2 shared store is not a collection of its own
-                        // (its collections are tenants inside it).
-                        if (MT_V2_NAME.test(collectionName)) continue;
+            if (!qdrantBackend.baseUrl || !await qdrantBackend.healthCheck()) {
+                incomplete.add('qdrant');
+            } else {
+                const listing = await qdrantBackend._request('GET', '/collections');
+                const collections = listing.result?.collections?.map(c => c.name);
+                if (!Array.isArray(collections)) throw new Error('Qdrant did not list its collections');
+                for (const collectionName of collections) {
+                    // 9c: a v2 shared store is not a collection of its own
+                    // (its collections are tenants inside it).
+                    if (MT_V2_NAME.test(collectionName)) continue;
+                    try {
                         if (ownerFilter && (isReservedSharedCollection(collectionName) ||
-                            await ownerFilter.ownerOf(collectionName) !== ownerFilter.handle)) continue;
+                            !await ownerFilter.allowed(collectionName))) continue;
                         const name = qdrantBackend._parseCollectionName(collectionName);
                         const route = `/collections/${name}`;
                         const countResponse = await qdrantBackend._request(
@@ -3578,10 +4060,14 @@ async function scanAllSourcesForCollections(vectorsPath, ownerFilter = null) {
                             id: collectionName, source, backend: 'qdrant',
                             chunkCount, modelCount: 1,
                         });
+                    } catch (e) {
+                        incomplete.add('qdrant');
+                        console.warn(`[${pluginName}] Qdrant: Failed to read ${collectionName}:`, e.message);
                     }
                 }
             }
         } catch (e) {
+            incomplete.add('qdrant');
             console.warn(`[${pluginName}] Qdrant: Failed to scan collections:`, e.message);
         }
 
@@ -3602,20 +4088,103 @@ async function scanAllSourcesForCollections(vectorsPath, ownerFilter = null) {
                 }
             }
         } catch (e) {
+            incomplete.add('milvus');
             console.warn(`[${pluginName}] Milvus: Failed to scan collections:`, e.message);
         }
 
     } catch (error) {
+        for (const backend of ['vectra', 'lancedb', 'qdrant', 'milvus']) incomplete.add(backend);
         console.error(`[${pluginName}] Error scanning collections:`, error);
     }
 
-    return allCollections;
+    return { collections: allCollections, incomplete: [...incomplete] };
+}
+
+/**
+ * VH-085: lists the requesting user's collections that live in v2 stores, from
+ * the saved settings each store keeps per tenant. A record counts only if it
+ * sits in the slot of THIS user's tenant for the collection id it names (the
+ * tenant key contains the user's handle), so other users' collections are
+ * never listed. Read-only. Each entry carries `storage` (layout, physical, dim).
+ * @returns {Promise<{collections: object[], incomplete: string[]}>}
+ */
+async function listV2TenantCollections(req) {
+    const collections = [];
+    const incomplete = [];
+    const decode = value => {
+        let record = value;
+        if (typeof record === 'string') { try { record = JSON.parse(record); } catch { return null; } }
+        if (!record || typeof record !== 'object' || record.vecthareTombstone === 1) return null;
+        if (typeof record.collectionId !== 'string' || record.snapshot?.schemaVersion !== 1) return null;
+        return record;
+    };
+    const mine = (key, record) => {
+        const tenant = tenantFor(req, record.collectionId);
+        return tenant && configKeyForTenant(tenant.tenantKey) === key ? tenant : null;
+    };
+    try {
+        if (qdrantBackend.baseUrl && await qdrantBackend.healthCheck()) {
+            const listing = await qdrantBackend._request('GET', '/collections');
+            const names = listing.result?.collections?.map(c => c.name);
+            if (!Array.isArray(names)) throw new Error('Qdrant did not list its collections');
+            for (const name of names.filter(n => MT_V2_NAME.test(n))) {
+                try {
+                    const info = await qdrantBackend._request('GET', `/collections/${name}`);
+                    const metadata = info?.result?.config?.metadata || {};
+                    const dim = Number(MT_V2_NAME.exec(name)[1]);
+                    for (const [key, value] of Object.entries(metadata)) {
+                        if (!key.startsWith('vecthare_initial_')) continue;
+                        const record = decode(value);
+                        const tenant = record && mine(key, record);
+                        if (!tenant) continue;
+                        const chunkCount = await qdrantBackend.countTenant(name, tenant.tenantKey);
+                        collections.push({ id: record.collectionId, source: record.snapshot.embedding?.provider || 'transformers',
+                            backend: 'qdrant', chunkCount, modelCount: 1, storage: { layout: 'mt-v2', physical: name, dim } });
+                    }
+                } catch (error) {
+                    if (!incomplete.includes('qdrant')) incomplete.push('qdrant');
+                    console.warn(`[${pluginName}] Qdrant: could not list the collections in ${name}:`, error.message);
+                }
+            }
+        }
+    } catch (error) {
+        if (!incomplete.includes('qdrant')) incomplete.push('qdrant');
+        console.warn(`[${pluginName}] Qdrant: v2 store listing failed:`, error.message);
+    }
+    try {
+        if (milvusBackend.isConnected) {
+            const names = await milvusBackend.listCollectionNames();
+            for (const name of names.filter(n => MT_V2_NAME.test(n) || /^vh_[0-9a-f]{24}$/.test(n))) {
+                try {
+                    const described = await milvusBackend.describeProperties(name);
+                    const layout = MT_V2_NAME.test(name) ? 'mt-v2' : 'per-collection';
+                    for (const [key, value] of Object.entries(described.properties || {})) {
+                        if (!key.startsWith('vecthare_initial_')) continue;
+                        const record = decode(value);
+                        const tenant = record && mine(key, record);
+                        if (!tenant) continue;
+                        const chunkCount = await milvusBackend.countV2(name, tenant.tenantKey);
+                        collections.push({ id: record.collectionId, source: record.snapshot.embedding?.provider || 'transformers',
+                            backend: 'milvus', chunkCount, modelCount: 1,
+                            storage: { layout, physical: name, ...(Number.isSafeInteger(described.dim) ? { dim: described.dim } : {}) } });
+                    }
+                } catch (error) {
+                    if (!incomplete.includes('milvus')) incomplete.push('milvus');
+                    console.warn(`[${pluginName}] Milvus: could not list the collections in ${name}:`, error.message);
+                }
+            }
+        }
+    } catch (error) {
+        if (!incomplete.includes('milvus')) incomplete.push('milvus');
+        console.warn(`[${pluginName}] Milvus: v2 store listing failed:`, error.message);
+    }
+    return { collections, incomplete };
 }
 
 /**
  * Find all vectra index.json files
  */
-async function findAllIndexes(dir, relativePath = '') {
+async function findAllIndexes(dir, relativePath = '', onError = null) {
     const results = [];
 
     try {
@@ -3626,7 +4195,7 @@ async function findAllIndexes(dir, relativePath = '') {
             const newRelativePath = relativePath ? path.join(relativePath, entry.name) : entry.name;
 
             if (entry.isDirectory()) {
-                const subResults = await findAllIndexes(fullPath, newRelativePath);
+                const subResults = await findAllIndexes(fullPath, newRelativePath, onError);
                 results.push(...subResults);
             } else if (entry.name === 'index.json') {
                 const pathParts = newRelativePath.split(path.sep);
@@ -3643,6 +4212,8 @@ async function findAllIndexes(dir, relativePath = '') {
         }
     } catch (e) {
         // Directory may not exist or not be readable - log at debug level since this is recursive
+        // (VH-008: an unreadable sub-folder, or an existing top folder, makes the listing incomplete).
+        if (relativePath !== '' || e.code !== 'ENOENT') onError?.(e);
         if (relativePath === '') {
             console.warn(`[${pluginName}] Vectra: Failed to scan vectors directory:`, e.message);
         }
@@ -3667,7 +4238,7 @@ async function getChunkCountFromIndex(indexPath) {
         return items.length;
     } catch (e) {
         console.warn(`[${pluginName}] Vectra: Failed to get chunk count from ${indexPath}:`, e.message);
-        return 0;
+        return null; // VH-008: unknown, not zero
     }
 }
 

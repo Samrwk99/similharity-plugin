@@ -85,9 +85,14 @@ export function collectRecordedCollections(state) {
         if (parsed && Array.isArray(record?.storageOldCopies)) {
             const entry = out.get(parsed.collectionId);
             for (const copy of record.storageOldCopies) {
-                if (isObject(copy) && typeof copy.physical === 'string' && typeof copy.layout === 'string') {
-                    entry.oldCopies.push({ backend: normBackend(copy.backend), layout: copy.layout, physical: copy.physical,
-                        ...(Number.isSafeInteger(copy.dim) ? { dim: copy.dim } : {}), ...(copy.movedAt ? { movedAt: copy.movedAt } : {}) });
+                // VH-010: a pending copy (the target of an unfinished move) may not
+                // know its physical store yet; it is matched by layout below.
+                const pendingUnknown = isObject(copy) && copy.pending === true && copy.physical == null;
+                if (isObject(copy) && (typeof copy.physical === 'string' || pendingUnknown) && typeof copy.layout === 'string') {
+                    entry.oldCopies.push({ backend: normBackend(copy.backend), layout: copy.layout, physical: copy.physical ?? null,
+                        ...(copy.pending === true ? { pending: true } : {}),
+                        ...(Number.isSafeInteger(copy.dim) ? { dim: copy.dim } : {}), ...(copy.movedAt ? { movedAt: copy.movedAt } : {}),
+                        ...(copy.startedAt ? { startedAt: copy.startedAt } : {}) });
                 }
             }
         }
@@ -263,7 +268,9 @@ async function qdrantSection(ctx, ids, report) {
                     if (store.error) continue;
                     const config = checkRecord(store.metadata[initialConfigKeyFor(tenantKey)], id, true, 'mt-v2');
                     const pointed = pointer?.backend === 'qdrant' && pointer.physical === store.name;
-                    if (config.status === 'missing' && !pointed) continue;
+                    // VH-010: an unfinished move may have left vectors here before
+                    // writing the saved settings; look whenever one is recorded.
+                    if (config.status === 'missing' && !pointed && !looksForPending(ctx, id, 'qdrant', 'mt-v2')) continue;
                     const count = await qdrant.countTenant(store.name, tenantKey);
                     if (count > 0 || config.status !== 'missing') {
                         locations.push({ layout: 'mt-v2', physical: store.name, count, dim: store.dim, config });
@@ -352,18 +359,35 @@ async function qdrantSection(ctx, ids, report) {
  * ("old copy (moved)") and do not make the collection a conflict. P8: a
  * location stamped with another user's name is flagged.
  */
+/** VH-010: does this collection record a pending copy in `layout` whose store is unknown? */
+function looksForPending(ctx, id, backend, layout) {
+    return (ctx.oldCopies?.get(id) || []).some(copy => copy.pending === true && copy.physical == null &&
+        copy.backend === backend && copy.layout === layout);
+}
+
 function splitOldCopies(row, locations, oldCopies, backend, ctx) {
     const named = (oldCopies || []).filter(copy => copy.backend === backend);
     const current = [];
     row.oldCopies = [];
+    // VH-010: where the collection lives now (its recorded locator); a pending
+    // copy whose store is not known yet is any other location in its layout.
+    const here = ctx.locators?.get(row.collectionId);
+    const herePhysical = here && normBackend(here.backend) === backend ? here.physical : null;
+    const matchOf = location => named.find(copy => copy.physical === location.physical) ||
+        named.find(copy => copy.pending === true && copy.physical == null && copy.layout === location.layout &&
+            location.physical !== herePhysical);
     for (const location of locations) {
         const owner = location.config?.owner;
         if (owner && ctx.userHandle && owner !== ctx.userHandle) location.foreignOwner = owner;
-        if (named.some(copy => copy.physical === location.physical)) row.oldCopies.push({ ...location, oldCopy: true });
+        const copy = matchOf(location);
+        if (copy) row.oldCopies.push({ ...location, oldCopy: true, ...(copy.pending ? { pending: true } : {}),
+            ...(copy.startedAt ? { startedAt: copy.startedAt } : {}), ...(copy.movedAt ? { movedAt: copy.movedAt } : {}) });
         else current.push(location);
     }
     for (const copy of named) {
-        if (!row.oldCopies.some(l => l.physical === copy.physical)) row.oldCopies.push({ ...copy, oldCopy: true, count: 0, note: 'nothing left there' });
+        const shown = row.oldCopies.some(l => l.physical === copy.physical ||
+            (copy.pending && copy.physical == null && l.pending && l.layout === copy.layout));
+        if (!shown) row.oldCopies.push({ ...copy, oldCopy: true, count: 0, note: 'nothing left there' });
     }
     if (!row.oldCopies.length) delete row.oldCopies;
     return current;
@@ -420,7 +444,7 @@ async function milvusSection(ctx, ids, report) {
                     if (store.error) continue;
                     const config = checkRecord(store.properties[initialConfigKeyFor(tenantKey)], id, undefined, 'mt-v2');
                     const pointed = pointer?.backend === 'milvus' && pointer.physical === store.name;
-                    if (config.status === 'missing' && !pointed) continue;
+                    if (config.status === 'missing' && !pointed && !looksForPending(ctx, id, 'milvus', 'mt-v2')) continue;
                     const count = await milvus.countV2(store.name, tenantKey);
                     if (count > 0 || config.status !== 'missing') {
                         v2Locations.push({ layout: 'mt-v2', physical: store.name, count, dim: store.dim, config });

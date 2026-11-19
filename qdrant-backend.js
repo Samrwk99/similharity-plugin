@@ -60,6 +60,26 @@ export function legacyContentTypeFromFilter(filter) {
     return isLegacyContentType(value) ? value : null;
 }
 
+/** VH-015: first Qdrant version that keeps collection metadata (saved settings). */
+export const QDRANT_MIN_VERSION = '1.15';
+
+
+/**
+ * VH-034: the fields of a row (text, hash, vector) are not chunk notes; an
+ * update must not copy them into the stored metadata (a vector there was sent
+ * to the browser with every listing). A vector left in by older builds is dropped.
+ */
+function mergeRowMetadata(existingMetadata, updates) {
+    const { text, hash, vector: _vector, ...notes } = updates || {};
+    const merged = { ...(existingMetadata || {}), ...notes };
+    // Where the stored metadata already mirrors the row's text/hash, keep the
+    // mirror current; never add them where they were not.
+    if (text !== undefined && Object.prototype.hasOwnProperty.call(merged, 'text')) merged.text = text;
+    if (hash !== undefined && Object.prototype.hasOwnProperty.call(merged, 'hash')) merged.hash = hash;
+    delete merged.vector;
+    return merged;
+}
+
 class QdrantBackend {
     /**
      * 9c: extra scope conditions. `tenantKey` (v2 layouts, set by the plugin's
@@ -132,13 +152,13 @@ class QdrantBackend {
      * @param {object|null} body - Request body
      * @param {number} maxRetries - Maximum retry attempts for transient failures
      */
-    async _request(method, endpoint, body = null, maxRetries = 3) {
+    async _request(method, endpoint, body = null, maxRetries = 3, timeoutMs = 60000) {
         const url = `${this.baseUrl}${endpoint}`;
 
         let lastError;
         for (let attempt = 0; attempt <= maxRetries; attempt++) {
             const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 60000);
+            const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
             const options = {
                 method,
                 headers: this._getHeaders(),
@@ -210,29 +230,63 @@ class QdrantBackend {
      * @param {object} config - Configuration { host, port, url, apiKey }
      */
     async initialize(config = {}) {
-        // Merge config
-        this.config = { ...this.config, ...config };
-        this.apiKey = this.config.apiKey || null;
+        // VH-001: the new configuration REPLACES the old one (an omitted key is
+        // cleared, never inherited from whoever initialised before), and it is
+        // tested on its own before it is swapped in: a failed init leaves the
+        // working connection untouched.
+        const next = {
+            host: config.host || '127.0.0.1',
+            port: config.port || 6333,
+            url: config.url || null,
+            apiKey: config.apiKey || null,
+        };
+        const apiKey = next.apiKey || null;
+        const baseUrl = next.url ? String(next.url).replace(/\/+$/, '') : `http://${next.host}:${next.port}`;
 
-        // Build base URL
-        if (this.config.url) {
-            // Cloud or custom URL - remove trailing slash
-            this.baseUrl = this.config.url.replace(/\/+$/, '');
-        } else {
-            // Local instance
-            this.baseUrl = `http://${this.config.host}:${this.config.port}`;
-        }
+        console.log('[Qdrant] Initializing with URL:', baseUrl);
+        console.log('[Qdrant] API Key:', apiKey ? '(set)' : '(not set)');
 
-        console.log('[Qdrant] Initializing with URL:', this.baseUrl);
-        console.log('[Qdrant] API Key:', this.apiKey ? '(set)' : '(not set)');
-
-        // Test connection
+        // Test connection with the candidate settings only
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 15000);
         try {
-            await this._request('GET', '/collections');
+            const response = await fetch(`${baseUrl}/collections`, {
+                method: 'GET',
+                headers: { 'Content-Type': 'application/json', ...(apiKey ? { 'api-key': apiKey } : {}) },
+                signal: controller.signal,
+            });
+            if (!response.ok) {
+                const text = await response.text().catch(() => '');
+                let message = text;
+                try { const json = JSON.parse(text); message = json.status?.error || json.message || text; } catch { /* text */ }
+                const error = new Error(`Qdrant GET /collections failed: ${response.status} ${message}`);
+                error.status = response.status;
+                throw error;
+            }
             console.log('[Qdrant] Connection successful');
         } catch (error) {
-            console.error('[Qdrant] Connection failed:', error.message);
-            throw error;
+            const reason = error.name === 'AbortError' ? 'timed out after 15 s' : error.message;
+            console.error('[Qdrant] Connection failed:', reason);
+            throw error.name === 'AbortError' ? new Error(`Qdrant connection to ${baseUrl} timed out`) : error;
+        } finally {
+            clearTimeout(timeoutId);
+        }
+
+        const changed = baseUrl !== this.baseUrl || apiKey !== this.apiKey;
+        this.config = next;
+        this.apiKey = apiKey;
+        this.baseUrl = baseUrl;
+        if (changed) this.v2Ensured = new Set(); // memo of the previous server
+
+        // VH-015: saved settings live in collection metadata, which Qdrant keeps
+        // only from 1.15 on (older versions accept the PATCH and drop it).
+        this.serverVersion = null;
+        try {
+            const root = await this._request('GET', '/', null, 0);
+            if (typeof root?.version === 'string') this.serverVersion = root.version;
+        } catch { /* unknown version: the read-back check below still protects writes */ }
+        if (this.serverVersion && !this.supportsCollectionMetadata()) {
+            console.warn(`[Qdrant] Server ${this.serverVersion} is older than ${QDRANT_MIN_VERSION}: VectHare can read but not write collections`);
         }
 
         // Ensure indexes exist on any existing vecthare_main collection
@@ -268,9 +322,24 @@ class QdrantBackend {
         return value && value.vecthareTombstone === 1 ? undefined : value;
     }
 
-    /** Write-once provenance stored in Qdrant's native collection metadata (1.16+). */
+    /** VH-015: true when the server keeps collection metadata (Qdrant 1.15+), null when unknown. */
+    supportsCollectionMetadata() {
+        if (!this.serverVersion) return null;
+        const [a, b] = this.serverVersion.split('.').map(n => parseInt(n, 10));
+        const [ma, mb] = QDRANT_MIN_VERSION.split('.').map(Number);
+        return a > ma || (a === ma && b >= mb);
+    }
+
+    /** VH-015: the refusal used before anything is written on a too-old server. */
+    tooOldMessage() {
+        return `VectHare needs Qdrant ${QDRANT_MIN_VERSION} or newer to store collections; this Qdrant server runs ${this.serverVersion}. ` +
+            'Update Qdrant; nothing was written.';
+    }
+
+    /** Write-once provenance stored in Qdrant's native collection metadata (Qdrant 1.15+). */
     async saveInitialCollectionConfig(physicalName, key, value) {
         if (!this.baseUrl) throw new Error('Qdrant not initialized');
+        if (this.supportsCollectionMetadata() === false) throw new Error(this.tooOldMessage());
         const name = encodeURIComponent(this._parseCollectionName(physicalName));
         const endpoint = `/collections/${name}`;
         const info = await this._request('GET', endpoint);
@@ -285,7 +354,7 @@ class QdrantBackend {
         await this._request('PATCH', endpoint, { metadata: { [key]: value } });
         const written = (await this._request('GET', endpoint))?.result?.config?.metadata?.[key];
         if (JSON.stringify(written) !== JSON.stringify(value)) {
-            throw new Error('Qdrant did not return the persisted initial configuration (requires Qdrant 1.16+)');
+            throw new Error(`Qdrant did not keep the saved collection settings (collection metadata needs Qdrant ${QDRANT_MIN_VERSION} or newer)`);
         }
         return true;
     }
@@ -383,7 +452,8 @@ class QdrantBackend {
                 console.log(`[Qdrant] Created index for ${field} (${schemaType})`);
             } catch (error) {
                 // Index might already exist, that's fine
-                if (!error.message?.includes('already exists') && !error.message?.includes('409')) {
+                // VH-069: decided on the HTTP status, not on "409" anywhere in the text.
+                if (error.status !== 409 && !/already exists/i.test(error.message || '')) {
                     console.warn(`[Qdrant] Failed to create index for ${field}:`, error.message);
                 }
             }
@@ -617,7 +687,7 @@ class QdrantBackend {
             }
 
             // Search
-            const response = await this._request('POST', `/collections/${mainCollection}/points/search`, searchPayload);
+            const response = await this._request('POST', `/collections/${mainCollection}/points/search`, searchPayload, 1, 20000); // VH-019
 
             // Format results
             return (response.result || []).map(result => ({
@@ -751,7 +821,7 @@ class QdrantBackend {
                 vectorPayload.filter = { must: [...must] };
             }
 
-            const vectorResponse = await this._request('POST', `/collections/${mainCollection}/points/search`, vectorPayload);
+            const vectorResponse = await this._request('POST', `/collections/${mainCollection}/points/search`, vectorPayload, 1, 20000); // VH-019
             const vectorResults = (vectorResponse.result || []).map(result => ({
                 hash: result.payload.hash,
                 text: result.payload.text,
@@ -1276,7 +1346,7 @@ class QdrantBackend {
 
             console.log(`[Qdrant] Purged ${mainCollection} (type: ${filters.type}, sourceId: ${filters.sourceId})`);
         } catch (error) {
-            if (error.message?.includes('404')) {
+            if (this._isNotFound(error)) {
                 return;
             }
             console.error(`[Qdrant] Purge failed for ${mainCollection}:`, error.message);
@@ -1307,7 +1377,7 @@ class QdrantBackend {
             await this._request('DELETE', `/collections/${mainCollection}`);
             console.log(`[Qdrant] Purged entire collection: ${mainCollection}`);
         } catch (error) {
-            if (error.message?.includes('404')) {
+            if (this._isNotFound(error)) {
                 return;
             }
             console.error(`[Qdrant] Purge all failed:`, error.message);
@@ -1493,7 +1563,7 @@ class QdrantBackend {
         const existing = await this.getItem(name, hash, { tenantKey: tenant.tenantKey });
         if (!existing) throw new Error(`Item with hash ${hash} not found`);
         const newHash = updates.hash || hash;
-        const metadata = { ...existing.metadata, ...updates };
+        const metadata = mergeRowMetadata(existing.metadata, updates);
         delete metadata.tenantKey; delete metadata.user;
         await this.insertV2(name, [{ hash: newHash, text: updates.text || existing.text,
             vector: updates.vector || existing.vector, metadata }], tenant, {
@@ -1609,7 +1679,7 @@ class QdrantBackend {
             hash: newHash,
             text: updates.text || existing.text,
             vector: updates.vector || existing.vector,
-            metadata: { ...existing.metadata, ...updates },
+            metadata: mergeRowMetadata(existing.metadata, updates),
         };
 
         // Write the replacement first (a point's ID is its hash, so an upsert

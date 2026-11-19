@@ -9,7 +9,7 @@ Server-side plugin for [the VectHare](https://github.com/Conejachibi/VectHare) e
 ## Features
 
 - **LanceDB Backend** - Disk-based vector storage with Apache Arrow format
-- **Qdrant Backend** - High-performance vector search with multitenancy support
+- **Qdrant Backend** - High-performance vector search with multitenancy support (requires Qdrant 1.15 or newer: saved collection settings live in collection metadata)
 - **Enhanced Vectra** - Full metadata storage (bypasses ST's hash/text/index limitation)
 - **Collection Browser** - List all collections across all backends
 - **Folder Explorer** - Open collection folders directly from UI
@@ -983,7 +983,7 @@ Coneja-Chibi
 [https://github.com/Conejachibi/VectHare](https://github.com/Conejachibi/VectHare)
 
 
-## Key store (build 13.22)
+## Key store
 
 Qdrant API key and Milvus token/password are kept per user in
 `<user>/vectors/vecthare-owned-state/secrets.json` (written atomically, mode 0600 where the
@@ -1000,7 +1000,7 @@ private-network, link-local and non-http(s) targets are refused. The server admi
 them with the environment variable `SIMILHARITY_ALLOW_PRIVATE_URLS=1`. The check is best
 effort (the name is resolved once for the check and again by the fetch).
 
-## Storage report (build 13.29)
+## Storage report
 
 `POST /storage/report` with `{ "defaults": { "backend", "source", "model", "qdrantMultitenancy" } }`
 (today's VectHare settings, only used to say what today's settings-based rule would pick).
@@ -1017,7 +1017,7 @@ admin; everyone else sees counts. `/health` advertises `capabilities.storageRepo
 Deletes in the legacy shared Qdrant store (`vecthare_multitenancy`) are limited to the
 caller's own points (`content_type`); a delete there without that scope is refused (409).
 
-## Storage locators (build 13.30)
+## Storage locators
 
 The extension records, per collection, where its vectors and saved original settings are
 (`collections[id].storage` in `collections.json`). `/storage/report` shows that locator for
@@ -1025,7 +1025,7 @@ each collection (`locator`, `locatorAgrees`) and counts them in `summary.locator
 `summary.locatorDisagrees`. Milvus hybrid queries are answered with 400 at once (no native
 hybrid query for Milvus); callers fall back to vector search.
 
-## Multitenancy v2 (build 13.31)
+## Multitenancy v2
 
 `/health` advertises `capabilities.scopedTenancy: 2`. A request that carries
 `storage: { layout, dim?, physical? }` (`layout`: Qdrant `mt-v2`; Milvus `mt-v2` or
@@ -1042,7 +1042,7 @@ physical store under `vecthare_initial_<sha256(tenantKey)>`; a purge empties tha
 Legacy multitenancy (`vecthare_multitenancy`): reads are limited to one collection when the
 request names `filters.content_type` explicitly (requests without it are unchanged).
 
-## Move storage and ownership (build 13.32)
+## Move storage and ownership
 
 `POST /storage/move` (Qdrant/Milvus, same server only):
 

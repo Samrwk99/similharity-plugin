@@ -28,6 +28,9 @@ let lancedb;
  * @param {string} collectionId - Raw collection ID
  * @returns {string} Sanitized table name
  */
+const OPTIMIZE_EVERY = 20;               // writes between compactions (LanceDB's rule of thumb)
+const KEEP_OLD_VERSIONS_MS = 10 * 60 * 1000;
+
 function sanitizeTableName(collectionId) {
     // Replace invalid characters with underscores
     // Keep: a-z, A-Z, 0-9, _, -, .
@@ -39,12 +42,67 @@ function sanitizeTableName(collectionId) {
  * Singleton that manages LanceDB connections and operations
  * Organizes collections by embedding source (like ST's standard backend)
  */
+
+/**
+ * VH-034: the fields of a row (text, hash, vector) are not chunk notes; an
+ * update must not copy them into the stored metadata (a vector there was sent
+ * to the browser with every listing). A vector left in by older builds is dropped.
+ */
+function mergeRowMetadata(existingMetadata, updates) {
+    const { text, hash, vector: _vector, ...notes } = updates || {};
+    const merged = { ...(existingMetadata || {}), ...notes };
+    // Where the stored metadata already mirrors the row's text/hash, keep the
+    // mirror current; never add them where they were not.
+    if (text !== undefined && Object.prototype.hasOwnProperty.call(merged, 'text')) merged.text = text;
+    if (hash !== undefined && Object.prototype.hasOwnProperty.call(merged, 'hash')) merged.hash = hash;
+    delete merged.vector;
+    return merged;
+}
+
 export class LanceDBBackend {
     constructor() {
         this.basePath = null;
         this.databases = new Map(); // Map source -> LanceDB connection
         this.collections = new Map(); // Cache of open collections: "source:tableName" -> table
         this.tableNameMap = new Map(); // Map original collection ID -> sanitized table name
+        // VH-030: writes to one table run one at a time (optimize() rewrites
+        // files and must not overlap a delete/add), and tables are compacted
+        // every OPTIMIZE_EVERY writes so fragments do not pile up.
+        this._tableQueues = new Map();      // "source:tableName" -> tail promise
+        this._writesSinceOptimize = new Map();
+        this._hashIndexed = new Set();
+    }
+
+    /** Runs fn after every earlier write to the same table has finished. */
+    _serial(key, fn) {
+        const previous = this._tableQueues.get(key) || Promise.resolve();
+        const run = previous.catch(() => {}).then(fn);
+        const tail = run.catch(() => {});
+        this._tableQueues.set(key, tail);
+        tail.then(() => { if (this._tableQueues.get(key) === tail) this._tableQueues.delete(key); });
+        return run;
+    }
+
+    /** VH-030: count a write; compact the table (and index `hash`) when due. Never throws. */
+    async _afterWrite(key, collection, { force = false } = {}) {
+        const writes = (this._writesSinceOptimize.get(key) || 0) + 1;
+        this._writesSinceOptimize.set(key, writes);
+        if (!force && writes < OPTIMIZE_EVERY) return;
+        this._writesSinceOptimize.set(key, 0);
+        try {
+            if (!this._hashIndexed.has(key)) {
+                const indices = await collection.listIndices();
+                if (!indices.some(index => index.columns?.includes('hash'))) {
+                    await collection.createIndex('hash', { config: lancedb.Index.btree() });
+                }
+                this._hashIndexed.add(key);
+            }
+            // Old versions are kept for a while so a query that is reading one
+            // is not cut off; compaction is what restores speed.
+            await collection.optimize({ cleanupOlderThan: new Date(Date.now() - KEEP_OLD_VERSIONS_MS) });
+        } catch (error) {
+            console.warn(`[LanceDB] Could not compact ${key}:`, error.message);
+        }
     }
 
     /**
@@ -207,7 +265,10 @@ export class LanceDBBackend {
             });
         }
         const records = [...byHash.values()];
+        await this._serial(cacheKey, () => this._writeRecords(collectionId, records, source, tableName, cacheKey, items.length));
+    }
 
+    async _writeRecords(collectionId, records, source, tableName, cacheKey, itemCount) {
         // Check if collection exists
         let collection = await this.getCollection(collectionId, source);
 
@@ -218,7 +279,9 @@ export class LanceDBBackend {
             // Create new table with first batch of records (use sanitized name)
             collection = await db.createTable(tableName, records);
             this.collections.set(cacheKey, collection);
-            console.log(`[LanceDB] Created collection: ${source}/${tableName} (${collectionId}) with ${items.length} vectors`);
+            this._writesSinceOptimize.delete(cacheKey);
+            this._hashIndexed.delete(cacheKey);
+            console.log(`[LanceDB] Created collection: ${source}/${tableName} (${collectionId}) with ${itemCount} vectors`);
         } else {
             // `add()` only appends, so a retry or a second sync used to store
             // the same hash twice (inflated counts; one delete removed every
@@ -247,6 +310,7 @@ export class LanceDBBackend {
             }
             console.log(`[LanceDB] Wrote ${records.length} vectors to ${source}/${tableName} ` +
                 `(${collectionId}), replacing ${previous.length} existing`);
+            await this._afterWrite(cacheKey, collection);
         }
     }
 
@@ -332,7 +396,8 @@ export class LanceDBBackend {
             hash: Number(r.hash),
             text: r.text,
             metadata: JSON.parse(r.metadata || '{}'),
-            vector: options.includeVectors ? r.vector : undefined,
+            // VH-087: LanceDB returns an Arrow vector, not an array.
+            vector: options.includeVectors && r.vector ? Array.from(r.vector) : undefined,
         }));
     }
 
@@ -395,8 +460,11 @@ export class LanceDBBackend {
 
         // Delete by hash
         const deleteFilter = `hash IN (${safeHashes.join(',')})`;
-
-        await collection.delete(deleteFilter);
+        const key = `${source}:${tableName}`;
+        await this._serial(key, async () => {
+            await collection.delete(deleteFilter);
+            await this._afterWrite(key, collection);
+        });
 
         console.log(`[LanceDB] Deleted ${safeHashes.length} items from ${source}/${collectionId}`);
     }
@@ -422,11 +490,15 @@ export class LanceDBBackend {
             return; // Collection doesn't exist
         }
 
-        try {
-            await db.dropTable(tableName);
-        } catch (error) {
-            console.warn(`[LanceDB] dropTable failed for ${tableName}:`, error.message);
-        }
+        await this._serial(cacheKey, async () => {
+            try {
+                await db.dropTable(tableName);
+            } catch (error) {
+                console.warn(`[LanceDB] dropTable failed for ${tableName}:`, error.message);
+            }
+        });
+        this._writesSinceOptimize.delete(cacheKey);
+        this._hashIndexed.delete(cacheKey);
 
         this.collections.delete(cacheKey);
         this.tableNameMap.delete(collectionId);
@@ -522,7 +594,9 @@ export class LanceDBBackend {
         return {
             hash: Number(r.hash),
             text: r.text,
-            vector: r.vector,
+            // VH-087: LanceDB returns an Arrow vector (not an array), which the
+            // insert path rejects - every metadata update and text edit failed.
+            vector: r.vector ? Array.from(r.vector) : r.vector,
             metadata: JSON.parse(r.metadata || '{}'),
         };
     }
@@ -568,7 +642,7 @@ export class LanceDBBackend {
             hash: newHash,
             text: updates.text || existing.text,
             vector: updates.vector || existing.vector,
-            metadata: { ...existing.metadata, ...updates },
+            metadata: mergeRowMetadata(existing.metadata, updates),
         };
 
         await this._replaceItem(collectionId, hash, existing, newItem, source);
@@ -626,8 +700,9 @@ export class LanceDBBackend {
         const count = await collection.countRows();
 
         // Get dimension from schema
-        const schema = collection.schema;
-        const vectorField = schema.fields.find(f => f.name === 'vector');
+        // VH-086: in @lancedb/lancedb 0.5+ schema() is an async method.
+        const schema = typeof collection.schema === 'function' ? await collection.schema() : collection.schema;
+        const vectorField = schema?.fields?.find(f => f.name === 'vector');
         const dimension = vectorField ? vectorField.type.listSize : 0;
 
         return {

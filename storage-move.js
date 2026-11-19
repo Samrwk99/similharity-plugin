@@ -137,8 +137,9 @@ function locationOps(ctx, backend, loc, tenant, collectionId) {
         remove: async () => {
             if (!loc.physical || !(await milvus.listCollectionNames()).includes(loc.physical)) return;
             if (legacy) {
-                await milvus.purgeCollection(MILVUS_LEGACY_SHARED, scopeTenant);
+                const purged = await milvus.purgeCollection(MILVUS_LEGACY_SHARED, scopeTenant);
                 await milvus.tombstoneLegacyConfig(legacyConfigKey(collectionId));
+                return purged; // VH-011: { leftShared }
             } else {
                 await milvus.purgeV2(loc.physical, tenant.tenantKey, { drop: loc.layout === 'per-collection', configKey: configKeyForTenant(tenant.tenantKey) });
             }
@@ -217,8 +218,15 @@ export async function copyCollection(ctx, { backend, collectionId, tenant, fromR
 export async function deleteCopy(ctx, { backend, collectionId, tenant, locationRaw }) {
     const loc = parseLocation(backend, collectionId, tenant.tenantKey, locationRaw);
     const ops = locationOps(ctx, backend, loc, tenant, collectionId);
-    await ops.remove();
+    const removed = await ops.remove();
+    // VH-011: in Milvus' older shared store, rows whose text another collection
+    // also stores have to stay; everything else must be gone.
+    if (backend === 'milvus' && loc.layout === 'legacy-shared') {
+        const { unshared, shared } = await ctx.milvus.countUnsharedItems({ type: tenant.type, sourceId: tenant.sourceId });
+        if (unshared !== 0) throw fail(`The copy could not be removed completely (${unshared} vectors remain)`, 500);
+        return { removed: true, ...(shared ? { leftShared: shared } : {}) };
+    }
     const left = await ops.count();
     if (left !== 0) throw fail(`The copy could not be removed completely (${left} vectors remain)`, 500);
-    return { removed: true };
+    return { removed: true, ...(removed?.leftShared ? { leftShared: removed.leftShared } : {}) };
 }

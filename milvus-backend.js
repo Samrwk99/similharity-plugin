@@ -61,10 +61,39 @@ export function normalizeMilvusTenant(tenant) {
     return { type, sourceId };
 }
 
+/** VH-077: Milvus keeps chunk text in a VARCHAR(65535) field (characters). */
+export const MILVUS_TEXT_MAX = 65535;
+function assertMilvusTextFits(items) {
+    for (const item of items) {
+        const length = typeof item?.text === 'string' ? [...item.text].length : 0;
+        if (length > MILVUS_TEXT_MAX) {
+            throw badRequest(`This chunk is too long for Milvus (${length} characters; Milvus stores at most ${MILVUS_TEXT_MAX}). ` +
+                'Shorten the message or use a smaller chunk size; nothing was written for it.');
+        }
+    }
+}
+
 /**
  * Milvus Backend Manager
  * Manages Milvus connection and operations
  */
+
+/**
+ * VH-034: the fields of a row (text, hash, vector) are not chunk notes; an
+ * update must not copy them into the stored metadata (a vector there was sent
+ * to the browser with every listing). A vector left in by older builds is dropped.
+ */
+function mergeRowMetadata(existingMetadata, updates) {
+    const { text, hash, vector: _vector, ...notes } = updates || {};
+    const merged = { ...(existingMetadata || {}), ...notes };
+    // Where the stored metadata already mirrors the row's text/hash, keep the
+    // mirror current; never add them where they were not.
+    if (text !== undefined && Object.prototype.hasOwnProperty.call(merged, 'text')) merged.text = text;
+    if (hash !== undefined && Object.prototype.hasOwnProperty.call(merged, 'hash')) merged.hash = hash;
+    delete merged.vector;
+    return merged;
+}
+
 class MilvusBackend {
     constructor() {
         this.client = null;
@@ -88,21 +117,38 @@ class MilvusBackend {
      * @param {object} config - Configuration { address, token, ssl, dimensions }
      */
     async initialize(config = {}) {
-        this.config = { ...this.config, ...config };
-        
-        console.log(`[Milvus] Initializing connection to ${this.config.address}...`);
-        
+        // VH-001: replace (never merge) the configuration, and connect a candidate
+        // client first; the working client is only swapped out on success.
+        const next = {
+            address: config.address || '127.0.0.1:19530',
+            token: config.token || '',
+            ssl: config.ssl === true,
+            dimensions: config.dimensions ?? null,
+        };
+
+        console.log(`[Milvus] Initializing connection to ${next.address}...`);
+
         try {
             ({ MilvusClient, DataType } = await import('@zilliz/milvus2-sdk-node'));
-            this.client = new MilvusClient({
-                address: this.config.address,
-                token: this.config.token,
-                ssl: this.config.ssl
+            const candidate = new MilvusClient({
+                address: next.address,
+                token: next.token,
+                ssl: next.ssl
             });
 
             // Test connection by listing collections
-            await this.client.listCollections();
+            await candidate.listCollections();
+            const previous = this.client;
+            const changed = !previous || next.address !== this.config.address || next.token !== this.config.token || next.ssl !== this.config.ssl;
+            this.client = candidate;
+            this.config = next;
             this.isConnected = true;
+            if (changed && previous && previous !== candidate) {
+                // idle-release timers belong to the previous server
+                for (const timer of this.v2Idle?.values() || []) clearTimeout(timer);
+                this.v2Idle = new Map();
+                Promise.resolve().then(() => previous.closeConnection?.()).catch(() => {});
+            }
             console.log('[Milvus] Connection successful');
             
             // H1: an existing vecthare_main is only loaded here (no size check:
@@ -119,7 +165,7 @@ class MilvusBackend {
             this.assertV2Supported().catch(error => console.warn(error.message));
             
         } catch (error) {
-            this.isConnected = false;
+            // The previous client (if any) is still in place and still connected.
             console.error('[Milvus] Connection failed:', error.message);
             throw error;
         }
@@ -410,6 +456,7 @@ class MilvusBackend {
     async insertVectors(collectionName, items, tenantMetadata = {}) {
         if (!this.isConnected) throw new Error('Milvus not initialized');
         if (items.length === 0) return;
+        assertMilvusTextFits(items);
         // Every row must carry the identity of the collection that owns it. A
         // row stamped 'unknown' could never be scoped, listed or deleted again.
         const tenant = normalizeMilvusTenant(tenantMetadata);
@@ -425,6 +472,30 @@ class MilvusBackend {
 
         // Ensure collection exists
         await this.ensureCollection(mainCollection, vectorSize);
+
+        // VH-027: a plain insert does not replace a row with the same primary key
+        // on a Milvus server, so a hash this collection already stores is skipped
+        // (as insertV2 does) instead of being added again.
+        const scope = this._buildFilterExpr(tenant);
+        if (!scope) throw badRequest('Milvus insert needs a valid collection identity (type and sourceId)');
+        this._assertSuccess(await this.client.loadCollection({ collection_name: mainCollection }), 'Load');
+        const existing = new Set();
+        const wanted = toSafeHashList(items.map(item => item.hash));
+        for (let i = 0; i < wanted.length; i += 1000) {
+            const res = await this.client.query({ collection_name: mainCollection, output_fields: ['hash'],
+                filter: `${scope} && hash in [${wanted.slice(i, i + 1000).join(',')}]`, limit: 16384, consistency_level: 'Strong' });
+            this._assertSuccess(res, 'Query');
+            if (!Array.isArray(res?.data)) throw new Error('[Milvus] Invalid query response');
+            for (const row of res.data) existing.add(String(Number(row.hash)));
+        }
+        const seen = new Set();
+        items = items.filter(item => {
+            const key = String(Number(item.hash));
+            if (existing.has(key) || seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        });
+        if (!items.length) return;
 
         // Prepare data matching schema
         const data = items.map(item => ({
@@ -498,6 +569,7 @@ class MilvusBackend {
             filter: `hash in [${hashes.join(',')}] && (type != ${quoteLiteral(tenant.type)} || sourceId != ${quoteLiteral(tenant.sourceId)})`,
             output_fields: ['hash'],
             limit: QUERY_LIMIT,
+            consistency_level: 'Strong', // VH-013: decides what a delete may remove
         });
         this._assertSuccess(res, 'Shared-hash check');
         if (!Array.isArray(res?.data)) throw new Error('[Milvus] Invalid query response');
@@ -616,7 +688,7 @@ class MilvusBackend {
         if (!expr) throw badRequest('Milvus count needs a valid collection identity (type and sourceId)');
         if (!await this._collectionExists()) return 0;
         this._assertSuccess(await this.client.loadCollection({ collection_name: 'vecthare_main' }), 'Load');
-        const res = await this.client.count({ collection_name: 'vecthare_main', expr, filter: expr });
+        const res = await this._strongCount('vecthare_main', expr);
         this._assertSuccess(res, 'Count');
         const total = Number(res?.data);
         if (!Number.isSafeInteger(total) || total < 0) throw new Error('[Milvus] Invalid count response');
@@ -712,7 +784,8 @@ class MilvusBackend {
                 filter: filterExpr,
                 output_fields: output_fields,
                 limit: limit,
-                offset: offset
+                offset: offset,
+                consistency_level: 'Strong', // VH-013: lists feed moves and verification
             });
             this._assertSuccess(results, 'Query');
             if (!Array.isArray(results?.data)) throw new Error('[Milvus] Invalid query response');
@@ -782,7 +855,8 @@ class MilvusBackend {
                 collection_name: mainCollection,
                 filter: `${scope} && hash == ${safeHash}`,
                 output_fields: ['hash', 'text', 'vector', 'metadata'],
-                limit: 1
+                limit: 1,
+                consistency_level: 'Strong', // VH-013
             });
             this._assertSuccess(results, 'Get item');
             if (!Array.isArray(results?.data)) throw new Error('[Milvus] Invalid query response');
@@ -815,7 +889,7 @@ class MilvusBackend {
             hash: newHash,
             text: updates.text || existing.text,
             vector: updates.vector || existing.vector,
-            metadata: { ...existing.metadata, ...updates }
+            metadata: mergeRowMetadata(existing.metadata, updates)
         };
 
         if (String(newHash) !== String(hash)) {
@@ -830,7 +904,12 @@ class MilvusBackend {
         try {
             await this.insertVectors(collectionName, [newItem], filters);
         } catch (error) {
-            await this.insertVectors(collectionName, [existing], filters).catch(() => {});
+            // VH-035: say so when the chunk could not be put back either.
+            const restored = await this.insertVectors(collectionName, [existing], filters).then(() => true, () => false);
+            if (!restored) {
+                throw new Error(`[Milvus] The update failed and chunk ${hash} could not be put back: it is missing now. ` +
+                    `Run Sync or Repair to store it again. (${error.message})`);
+            }
             throw error;
         }
     }
@@ -850,47 +929,63 @@ class MilvusBackend {
         const scope = this._scope(t);
 
         try {
-            if (!await this._collectionExists()) return;
+            if (!await this._collectionExists()) return { leftShared: 0 };
             this._assertSuccess(await this.client.loadCollection({ collection_name: 'vecthare_main' }), 'Load');
-            // Repeatedly take the first rows of this collection and remove them
-            // through the guarded delete. Deleted rows disappear, so offset 0
-            // always yields the next batch; any blocked row stops the loop.
-            // Strong consistency: a delete must be visible to the next read.
-            let previous = null;
-            for (let guard = 0; guard < 100000; guard++) {
-                const page = await this.client.query({
+            // VH-011 (option B): in this older shared store the primary key is the
+            // text hash, so a row whose text another collection also stores
+            // cannot be deleted without deleting that collection's row too.
+            // Decide up front which rows those are, delete every other row of
+            // this collection, then confirm that exactly the shared ones remain.
+            const { own, shared } = await this._ownAndSharedHashes(t);
+            const unshared = own.filter(hash => !shared.has(hash));
+            for (let i = 0; i < unshared.length; i += 1000) {
+                const batch = unshared.slice(i, i + 1000);
+                const res = await this.client.delete({
                     collection_name: 'vecthare_main',
-                    filter: scope,
-                    output_fields: ['hash'],
-                    limit: 1000,
-                    consistency_level: 'Strong',
+                    filter: `${scope} && hash in [${batch.join(',')}]`,
                 });
-                this._assertSuccess(page, 'Purge listing');
-                if (!Array.isArray(page?.data)) throw new Error('[Milvus] Invalid query response');
-                if (page.data.length === 0) break;
-                const signature = page.data.map(row => String(row.hash)).sort().join(',');
-                if (signature === previous) {
-                    throw new Error('[Milvus] Purge made no progress; rows remain for this collection');
-                }
-                previous = signature;
-                await this.deleteVectors(collectionName, page.data.map(row => row.hash), t);
+                this._assertSuccess(res, 'Delete');
             }
-            const remaining = await this.client.query({
-                collection_name: 'vecthare_main',
-                filter: scope,
-                output_fields: ['hash'],
-                limit: 1,
-                consistency_level: 'Strong',
-            });
-            this._assertSuccess(remaining, 'Purge verification');
-            if (!Array.isArray(remaining?.data) || remaining.data.length !== 0) {
-                throw new Error('[Milvus] Purge could not be confirmed: rows remain for this collection');
+            const remaining = await this._allHashesIn('vecthare_main', scope);
+            const unexpected = remaining.filter(hash => !shared.has(String(hash)));
+            if (unexpected.length) {
+                throw new Error(`[Milvus] Purge could not be confirmed: ${unexpected.length} row(s) remain for this collection`);
             }
-            console.log(`[Milvus] Purged ${t.type}/${t.sourceId}`);
+            console.log(`[Milvus] Purged ${t.type}/${t.sourceId}` +
+                (remaining.length ? ` (${remaining.length} row(s) shared with another collection left in place)` : ''));
+            return { leftShared: remaining.length };
         } catch (error) {
             console.error('[Milvus] Purge failed:', error.message);
-            throw error; // a failed purge must not be reported as a confirmed deletion
+            throw error;
         }
+    }
+
+    /**
+     * VH-011: this collection's hashes in the shared store, and which of them
+     * another collection stores too.
+     * @returns {Promise<{own: string[], shared: Set<string>}>}
+     */
+    async _ownAndSharedHashes(tenant) {
+        const own = [...new Set((await this._allHashesIn('vecthare_main', this._scope(tenant))).map(h => String(Number(h))))];
+        const shared = new Set();
+        for (let i = 0; i < own.length; i += 1000) {
+            for (const hash of await this._hashesHeldElsewhere(own.slice(i, i + 1000), tenant)) shared.add(String(hash));
+        }
+        return { own, shared };
+    }
+
+    /**
+     * VH-011: rows of this collection whose text no other collection stores -
+     * what a delete must have removed. 0 means deleted (shared rows that had to
+     * stay do not count).
+     */
+    async countUnsharedItems(filters) {
+        if (!this.isConnected) throw new Error('Milvus not initialized');
+        const t = normalizeMilvusTenant(filters);
+        if (!t || t === ALL_TENANTS) throw badRequest('Milvus count needs a valid collection identity (type and sourceId)');
+        if (!await this._collectionExists()) return { unshared: 0, shared: 0 };
+        const { own, shared } = await this._ownAndSharedHashes(t);
+        return { unshared: own.filter(hash => !shared.has(hash)).length, shared: own.filter(hash => shared.has(hash)).length };
     }
 
     /**
@@ -1055,13 +1150,15 @@ class MilvusBackend {
      * the identity ledger rule out two writers at once).
      * @returns {Promise<number>} rows written
      */
-    async insertV2(name, items, tenant, embedding = {}, { partitionKey }) {
+    async insertV2(name, items, tenant, embedding = {}, { partitionKey, replacing = false }) {
         if (!items.length) return 0;
+        assertMilvusTextFits(items);
         const dim = items[0].vector?.length || 0;
         if (!dim || items.some(item => item.vector?.length !== dim)) throw new Error('[Milvus] Invalid or mixed vector dimensions');
         await this.ensureV2Collection(name, dim, { partitionKey });
         const hashes = toSafeHashList(items.map(item => item.hash));
-        const existing = await this._v2ExistingHashes(name, tenant.tenantKey, hashes);
+        // `replacing` (VH-035): the caller removes the old rows afterwards by id.
+        const existing = replacing ? new Set() : await this._v2ExistingHashes(name, tenant.tenantKey, hashes);
         const seen = new Set();
         const rows = [];
         items.forEach((item, i) => {
@@ -1102,11 +1199,76 @@ class MilvusBackend {
         return deleted;
     }
 
+    /**
+     * VH-027: every hash in a scope, without the 16,384 offset+limit window.
+     * Hash ranges are read whole; a range that fills a page is split in two.
+     * The rows read must equal the scope's count, otherwise it throws.
+     * @returns {Promise<number[]>} distinct hashes
+     */
+    async _allHashesIn(collectionName, scopeExpr) {
+        const PAGE = 16384;
+        const rowsIn = async (lo, hi) => {
+            const res = await this.client.query({ collection_name: collectionName, output_fields: ['hash'],
+                filter: `${scopeExpr} && hash > ${lo} && hash <= ${hi}`, limit: PAGE, consistency_level: 'Strong' });
+            this._assertSuccess(res, 'Query');
+            if (!Array.isArray(res?.data)) throw new Error('[Milvus] Invalid query response');
+            return res.data;
+        };
+        const out = [];
+        const walk = async (lo, hi) => {
+            const rows = await rowsIn(lo, hi);
+            if (rows.length < PAGE) { out.push(...rows.map(r => Number(r.hash))); return; }
+            if (hi - lo <= 1n) throw new Error('[Milvus] Too many rows share one hash; the hash list cannot be read completely');
+            const mid = lo + (hi - lo) / 2n;
+            await walk(lo, mid);
+            await walk(mid, hi);
+        };
+        // Bounds stay inside int64 (an out-of-range literal matches nothing). The
+        // one value -2^63 is not covered; the count check below catches it.
+        await walk(-(2n ** 63n), 2n ** 63n - 1n);
+        const counted = await this._strongCount(collectionName, scopeExpr);
+        this._assertSuccess(counted, 'Count');
+        if (Number(counted?.data) !== out.length) {
+            throw new Error(`[Milvus] Hash list incomplete (${out.length} of ${counted?.data} rows read)`);
+        }
+        return [...new Set(out)];
+    }
+
+    /** VH-027: all hashes of one legacy (vecthare_main) collection. */
+    async listAllHashes(filters) {
+        if (!this.isConnected) throw new Error('Milvus not initialized');
+        const expr = this._buildFilterExpr(filters);
+        if (!expr) throw badRequest('Milvus listing needs a valid collection identity (type and sourceId)');
+        if (!await this._collectionExists()) return [];
+        this._assertSuccess(await this.client.loadCollection({ collection_name: 'vecthare_main' }), 'Load');
+        return this._allHashesIn('vecthare_main', expr);
+    }
+
+    /** VH-027: all hashes of one tenant in a v2 collection. */
+    async listAllHashesV2(name, tenantKey) {
+        if (!await this._v2Exists(name)) return [];
+        await this._v2Load(name);
+        return this._allHashesIn(name, this._v2Scope(tenantKey));
+    }
+
+    /**
+     * VH-013: counts with Strong consistency, like the lists and deletes they are
+     * compared with. The SDK's client.count() drops consistency_level, so the
+     * count is made with query() and count(*), the same request count() sends.
+     * @returns {Promise<{status: object, data: number}>}
+     */
+    async _strongCount(collectionName, expr) {
+        const res = await this.client.query({ collection_name: collectionName, expr, filter: expr,
+            output_fields: ['count(*)'], consistency_level: 'Strong' });
+        const row = Array.isArray(res?.data) ? res.data[0] : null;
+        return { status: res?.status, data: row ? Number(row['count(*)']) : NaN };
+    }
+
     async countV2(name, tenantKey) {
         if (!await this._v2Exists(name)) return 0;
         await this._v2Load(name);
         const expr = this._v2Scope(tenantKey);
-        const res = await this.client.count({ collection_name: name, expr, filter: expr });
+        const res = await this._strongCount(name, expr);
         this._assertSuccess(res, 'Count');
         const total = Number(res?.data);
         if (!Number.isSafeInteger(total) || total < 0) throw new Error('[Milvus] Invalid count response');
@@ -1153,19 +1315,25 @@ class MilvusBackend {
         if (!existing) throw new Error(`Item ${hash} not found`);
         const newHash = updates.hash || hash;
         const item = { hash: newHash, text: updates.text || existing.text, vector: updates.vector || existing.vector,
-            metadata: { ...existing.metadata, ...updates } };
+            metadata: mergeRowMetadata(existing.metadata, updates) };
         if (String(newHash) !== String(hash)) {
             await this.insertV2(name, [item], tenant, embedding, options);
             await this.deleteV2(name, [hash], tenant.tenantKey);
             return;
         }
-        await this.deleteV2(name, [hash], tenant.tenantKey);
-        try {
-            await this.insertV2(name, [item], tenant, embedding, options);
-        } catch (error) {
-            await this.insertV2(name, [existing], tenant, embedding, options).catch(() => {});
-            throw error;
-        }
+        // VH-035: rows have their own ids, so the new row is written first and
+        // the old one removed afterwards by id. A failed write leaves the old
+        // row untouched; a failed removal leaves both, and the next attempt
+        // (or Repair's duplicate check) settles it. The chunk is never missing.
+        await this._v2Load(name);
+        const oldRows = await this._v2Query(name,
+            `${this._v2Scope(tenant.tenantKey)} && hash in [${toSafeHashList([hash]).join(',')}]`, ['id']);
+        const oldIds = oldRows.map(row => String(row.id)).filter(id => /^-?\d+$/.test(id));
+        if (!oldIds.length) throw new Error(`Item ${hash} not found`);
+        const written = await this.insertV2(name, [item], tenant, embedding, { ...options, replacing: true });
+        if (written !== 1) throw new Error('[Milvus] The updated chunk was not written; the old one is unchanged');
+        const res = await this.client.delete({ collection_name: name, filter: `id in [${oldIds.join(',')}]` });
+        this._assertSuccess(res, 'Delete');
     }
 
     /**
