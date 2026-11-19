@@ -240,14 +240,39 @@ export async function init(router) {
                         }
                         if (model && safeModel !== model) {
                             // Distinct model IDs can sanitize to the same folder.
-                            // Require its saved VectHare provenance to identify
-                            // the requested model before deleting that folder.
-                            const raw = await fs.readFile(path.join(folder, 'vecthare-initial-config.json'), 'utf8');
-                            const config = JSON.parse(raw);
-                            if (config?.collectionId !== collectionId ||
-                                config.snapshot?.embedding?.provider !== source ||
-                                config.snapshot?.embedding?.model !== model) {
-                                throw new Error('Sanitized Vectra model destination is not verified');
+                            // Prefer the saved VectHare provenance to identify the
+                            // requested model before deleting that folder.
+                            let config = null;
+                            try {
+                                config = JSON.parse(await fs.readFile(
+                                    path.join(folder, 'vecthare-initial-config.json'), 'utf8'));
+                            } catch (error) {
+                                if (error.code !== 'ENOENT' && !(error instanceof SyntaxError)) throw error;
+                            }
+                            if (config) {
+                                if (config.collectionId !== collectionId ||
+                                    config.snapshot?.embedding?.provider !== source ||
+                                    config.snapshot?.embedding?.model !== model) {
+                                    throw new Error('Sanitized Vectra model destination is not verified');
+                                }
+                            } else {
+                                // A legacy collection has no provenance file. The
+                                // ambiguity this check guards against only exists
+                                // when the collection has more than one model
+                                // destination; with exactly one there is no other
+                                // model index that could be confused with it, and
+                                // the path already scopes the deletion to this
+                                // collection and source. Otherwise, refuse.
+                                const siblings = await fs.readdir(path.dirname(folder),
+                                    { withFileTypes: true });
+                                const models = siblings.filter(entry => entry.isDirectory() &&
+                                    !entry.isSymbolicLink());
+                                if (models.length !== 1 || models[0].name !== safeModel) {
+                                    throw new Error('Sanitized Vectra model destination cannot be ' +
+                                        'identified: no VectHare provenance file names the model this ' +
+                                        'folder holds, and this collection has more than one model ' +
+                                        'destination; purge blocked');
+                                }
                             }
                         }
                         if (!model) {
@@ -763,6 +788,104 @@ export async function init(router) {
         }
     });
 
+    // ========================================================================
+    // VECTHARE-OWNED LOCAL STATE (collections.json)
+    // ========================================================================
+    // Phase 1: VectHare's own registry, collection metadata, chat bindings and
+    // chunk annotations live in one authoritative per-user file instead of
+    // SillyTavern's extension settings. Identity ledgers keep their own files
+    // and the authoritative original vectorization configuration stays
+    // backend-resident; neither is stored here.
+
+    const OWNED_STATE_DIRECTORY = 'vecthare-owned-state';
+    const OWNED_STATE_FILE = 'collections.json';
+    const OWNED_STATE_MAX_BYTES = 16 * 1024 * 1024;
+
+    function ownedStatePath(req) {
+        const root = path.join(req.user.directories.vectors, OWNED_STATE_DIRECTORY);
+        return { root, filename: path.join(root, OWNED_STATE_FILE) };
+    }
+
+    async function ensureOwnedStateDirectory(root) {
+        await fs.mkdir(root, { recursive: true });
+        const stat = await fs.lstat(root);
+        const parent = await fs.realpath(path.dirname(root));
+        if (!stat.isDirectory() || stat.isSymbolicLink() ||
+            await fs.realpath(root) !== path.join(parent, OWNED_STATE_DIRECTORY)) {
+            throw new Error('Unsafe VectHare state storage directory');
+        }
+    }
+
+    const isPlainObject = value => Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+
+    function validateOwnedState(state) {
+        if (!isPlainObject(state) || state.version !== 1 ||
+            !Array.isArray(state.registry) || !state.registry.every(id => typeof id === 'string') ||
+            !isPlainObject(state.collections) || !isPlainObject(state.chunkMetadata) ||
+            !isPlainObject(state.chatCollectionPolicies) ||
+            !isPlainObject(state.chatCollectionBindings) ||
+            !isPlainObject(state.chatCollectionBindings.byCollection)) {
+            throw new Error('Invalid VectHare state document');
+        }
+    }
+
+    router.post('/owned-state/read', async (req, res) => {
+        try {
+            const { filename } = ownedStatePath(req);
+            let raw;
+            try {
+                raw = await fs.readFile(filename, 'utf8');
+            } catch (error) {
+                // A missing file is a fact the caller must be able to act on; it
+                // is never reported as an empty store.
+                if (error.code === 'ENOENT') return res.json({ success: true, status: 'missing' });
+                throw error;
+            }
+            let state;
+            try {
+                state = JSON.parse(raw);
+                validateOwnedState(state);
+            } catch (error) {
+                // Unreadable content must not be mistaken for "no collections".
+                return res.json({ success: true, status: 'invalid', reason: error.message });
+            }
+            return res.json({ success: true, status: 'found', state });
+        } catch (error) {
+            console.error('[Similharity] Failed to read VectHare state:', error);
+            return res.status(500).json({ error: error.message });
+        }
+    });
+
+    router.post('/owned-state/write', async (req, res) => {
+        let temporary = null;
+        try {
+            const { state } = req.body;
+            validateOwnedState(state);
+            const serialized = JSON.stringify(state);
+            if (Buffer.byteLength(serialized, 'utf8') > OWNED_STATE_MAX_BYTES) {
+                return res.status(413).json({ error: 'VectHare state document too large' });
+            }
+            const { root, filename } = ownedStatePath(req);
+            await ensureOwnedStateDirectory(root);
+            temporary = path.join(root, `${OWNED_STATE_FILE}.${randomUUID()}.tmp`);
+            await fs.writeFile(temporary, serialized, { flag: 'wx', encoding: 'utf8' });
+            await fs.rename(temporary, filename);
+            temporary = null;
+            // Read back before reporting success: a write the caller cannot
+            // re-read is not a write it may treat as authoritative.
+            const verification = await fs.readFile(filename, 'utf8');
+            if (verification !== serialized) {
+                throw new Error('VectHare state verification failed after write');
+            }
+            return res.json({ success: true, verified: true, bytes: Buffer.byteLength(serialized, 'utf8') });
+        } catch (error) {
+            console.error('[Similharity] Failed to write VectHare state:', error);
+            return res.status(400).json({ error: error.message });
+        } finally {
+            if (temporary) await fs.unlink(temporary).catch(() => {});
+        }
+    });
+
     // A small, durable VectHare-owned purge intent. Standard's native purge
     // removes its initial-config file; this record survives a browser reload
     // so an interrupted ledger cleanup can be finished without guessing a
@@ -916,6 +1039,125 @@ export async function init(router) {
     });
 
     /** Read saved provenance only. Never creates a collection or changes vectors. */
+    // ========================================================================
+    // EXPLICIT PHYSICAL EXISTENCE
+    // ========================================================================
+    // A registry entry, a folder name or a chunk count of zero is not evidence
+    // that a collection exists. This asks the recorded backend directly and
+    // answers 'present', 'absent' or 'unverified'. Anything that cannot be
+    // established - unreachable backend, ambiguous destination, malformed
+    // response - is 'unverified' and never reported as absent.
+    router.post('/collections/exists', async (req, res) => {
+        try {
+            const { backend = 'vectra', collectionId, physicalCollectionId, source, model } = req.body;
+            // Read-only route: it reports whether a collection exists and
+            // creates, changes and deletes nothing, so it is NOT restricted to
+            // VectHare-owned identities. The ownership gate belongs on the
+            // write and delete routes; applying it here left every other
+            // collection permanently unverifiable. The identity is still
+            // validated for shape so it can never escape its own destination.
+            if (typeof collectionId !== 'string' || !collectionId || collectionId.length > 255 ||
+                /[\\/]|\.\.|[\u0000-\u001f]/.test(collectionId)) {
+                return res.status(400).json({ error: 'Invalid collectionId' });
+            }
+            const unverified = reason => res.json({ success: true, existence: 'unverified', reason });
+
+            if (backend === 'qdrant') {
+                const physical = physicalCollectionId || collectionId;
+                // A shared multitenancy collection says nothing about whether
+                // one logical collection inside it exists.
+                if (physical !== collectionId) {
+                    return unverified('A shared Qdrant collection cannot confirm one logical collection');
+                }
+                try {
+                    const present = await qdrantBackend.collectionExists(physical);
+                    return res.json({ success: true, existence: present ? 'present' : 'absent' });
+                } catch (error) {
+                    return unverified(`Qdrant could not be checked: ${error.message}`);
+                }
+            }
+
+            if (backend === 'milvus') {
+                try {
+                    if (!await milvusBackend.physicalCollectionExists()) {
+                        return res.json({ success: true, existence: 'absent' });
+                    }
+                    // Milvus keeps every logical collection in one physical
+                    // collection, so a logical collection with no rows cannot
+                    // be told apart from one that never existed.
+                    const rows = await milvusBackend.countItems({ collectionId });
+                    return rows > 0
+                        ? res.json({ success: true, existence: 'present', count: rows, countTrusted: true })
+                        : unverified('A shared-store logical collection with no rows cannot be distinguished from an absent one');
+                } catch (error) {
+                    return unverified(`Milvus could not be checked: ${error.message}`);
+                }
+            }
+
+            if (backend === 'lancedb') {
+                try {
+                    const present = await lancedbBackend.tableExists(collectionId, source);
+                    return res.json({ success: true, existence: present ? 'present' : 'absent' });
+                } catch (error) {
+                    return unverified(`LanceDB could not be checked: ${error.message}`);
+                }
+            }
+
+            // Vectra / Standard: the index directory for the exact recorded
+            // provider and model folder. Never create anything here.
+            const safeCollection = sanitize(String(collectionId));
+            const safeSource = sanitize(String(source || ''));
+            const safeModel = sanitize(String(model || ''));
+            if (!safeCollection || !safeSource || safeSource !== String(source) ||
+                (model && safeModel !== String(model))) {
+                return unverified('The recorded Vectra destination could not be resolved safely');
+            }
+            const base = path.join(req.user.directories.vectors, safeSource, safeCollection);
+            const isIndex = async folder => {
+                try {
+                    if (!(await fs.stat(folder)).isDirectory()) return false;
+                    return (await fs.stat(path.join(folder, 'index.json'))).isFile();
+                } catch (error) {
+                    if (error.code === 'ENOENT') return false;
+                    throw error;
+                }
+            };
+            try {
+                if (model) {
+                    const present = await isIndex(path.join(base, safeModel));
+                    return res.json({ success: true, existence: present ? 'present' : 'absent' });
+                }
+                // No recorded model: the collection exists if its own folder is
+                // an index, or if exactly one model subfolder is. Several
+                // candidates leave the destination ambiguous.
+                if (await isIndex(base)) return res.json({ success: true, existence: 'present' });
+                let subfolders = [];
+                try {
+                    subfolders = (await fs.readdir(base, { withFileTypes: true }))
+                        .filter(entry => entry.isDirectory()).map(entry => entry.name);
+                } catch (error) {
+                    if (error.code === 'ENOENT') return res.json({ success: true, existence: 'absent' });
+                    throw error;
+                }
+                const present = [];
+                for (const name of subfolders) {
+                    if (await isIndex(path.join(base, name))) present.push(name);
+                }
+                if (present.length === 0) return res.json({ success: true, existence: 'absent' });
+                if (present.length === 1) {
+                    return res.json({ success: true, existence: 'present', model: present[0] });
+                }
+                return unverified(`${present.length} model folders exist for this collection; ` +
+                    'the recorded destination is ambiguous');
+            } catch (error) {
+                return unverified(`The Vectra destination could not be read: ${error.message}`);
+            }
+        } catch (error) {
+            console.error('[Similharity] Existence check failed:', error);
+            return res.status(500).json({ error: error.message });
+        }
+    });
+
     router.post('/collections/initial-config/read', async (req, res) => {
         try {
             const { backend = 'standard', collectionId, physicalCollectionId,
@@ -1911,18 +2153,34 @@ async function _getLegacySingleEmbedding(source, text, model, directories, req, 
      * Purge all chunks in a collection
      * Body: { backend, collectionId, source?, model? }
      */
-    router.post('/chunks/purge', requireVectHareCollection, async (req, res) => {
+    router.post('/chunks/purge', async (req, res) => {
         try {
             const {
                 backend = 'vectra',
                 collectionId,
                 source = 'transformers',
                 model = '',
-                filters = {}
+                filters = {},
+                confirmUnowned = false
             } = req.body;
 
             if (!collectionId) {
                 return res.status(400).json({ error: 'collectionId is required' });
+            }
+            // The ownership gate stands for every caller EXCEPT a whole-collection
+            // deletion the user explicitly confirmed for this exact destination.
+            // A collection created before VectHare recorded ownership carries no
+            // marker and would otherwise be undeletable forever. A filtered purge
+            // never qualifies: it edits a collection rather than removing it.
+            if (!isVectHareCollection(collectionId)) {
+                const wholeCollection = !filters || !Object.keys(filters).length;
+                if (confirmUnowned !== true || !wholeCollection) {
+                    return res.status(403).json({
+                        error: 'Only VectHare-owned collection IDs may be modified',
+                    });
+                }
+                console.warn(`[${pluginName}] Purging ${backend}/${source} collection ` +
+                    `"${collectionId}" on explicit user confirmation: not a VectHare-owned ID`);
             }
 
             if (backend === 'lancedb') {

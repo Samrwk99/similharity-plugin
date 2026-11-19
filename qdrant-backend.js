@@ -1238,6 +1238,21 @@ class QdrantBackend {
 
 
 
+    /**
+     * Explicit existence of one collection, for the Database Browser's
+     * classification. Errors propagate: an unreachable Qdrant must be reported
+     * as unverified by the caller, never as absence.
+     * @param {string} collectionName Physical collection name
+     * @returns {Promise<boolean>} Whether Qdrant reports the collection
+     */
+    async collectionExists(collectionName) {
+        if (!this.baseUrl) throw new Error('Qdrant not initialized');
+        const collections = await this._request('GET', '/collections');
+        const names = collections.result?.collections?.map(item => item.name);
+        if (!Array.isArray(names)) throw new Error('Qdrant returned no collection list');
+        return names.includes(collectionName);
+    }
+
     async getCollections() {
         if (!this.baseUrl) throw new Error('Qdrant not initialized');
         try {

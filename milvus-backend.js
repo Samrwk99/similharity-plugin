@@ -383,6 +383,15 @@ class MilvusBackend {
     }
 
     /** Absence is a legitimate empty result; any other failure must surface. */
+    /**
+     * Explicit existence of the shared physical collection. Errors propagate so
+     * the caller can report 'unverified' instead of absence.
+     * @returns {Promise<boolean>}
+     */
+    async physicalCollectionExists() {
+        return await this._collectionExists();
+    }
+
     async _collectionExists() {
         const res = await this.client.hasCollection({ collection_name: 'vecthare_main' });
         this._assertSuccess(res, 'Collection check');

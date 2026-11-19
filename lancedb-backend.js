@@ -66,6 +66,22 @@ class LanceDBBackend {
      * @param {string} source - Embedding source (transformers, openai, palm, etc.)
      * @returns {Promise<Object>} LanceDB database connection
      */
+    /**
+     * Explicit existence of one collection's table at the recorded source.
+     * Errors propagate so the caller can report 'unverified' rather than
+     * treating an unreachable store as absence.
+     * @param {string} collectionId Logical collection id
+     * @param {string} source Embedding source directory
+     * @returns {Promise<boolean>} Whether the table exists
+     */
+    async tableExists(collectionId, source = 'transformers') {
+        const tableName = sanitizeTableName(collectionId);
+        const db = await this.getDatabase(source);
+        const tableNames = await db.tableNames();
+        if (!Array.isArray(tableNames)) throw new Error('LanceDB returned no table list');
+        return tableNames.includes(tableName);
+    }
+
     async getDatabase(source = 'transformers') {
         if (!this.basePath) throw new Error('LanceDB not initialized');
         // A source is one provider directory, never a request-controlled path.
