@@ -672,6 +672,113 @@ export async function init(router) {
         }
     });
 
+    /** Read saved provenance only. Never creates a collection or changes vectors. */
+    router.post('/collections/initial-config/read', async (req, res) => {
+        try {
+            const { backend = 'standard', collectionId, physicalCollectionId,
+                source = 'transformers', model = '' } = req.body || {};
+            if (typeof collectionId !== 'string' || !collectionId ||
+                typeof source !== 'string' || !source || typeof model !== 'string' ||
+                !['standard', 'vectra', 'lancedb', 'qdrant', 'milvus'].includes(backend)) {
+                return res.status(400).json({ error: 'Invalid collection location' });
+            }
+            let record;
+            if (backend === 'qdrant' || backend === 'milvus') {
+                const key = `vecthare_initial_${createHash('sha256').update(collectionId).digest('hex')}`;
+                if (backend === 'qdrant') {
+                    if (physicalCollectionId !== collectionId &&
+                        physicalCollectionId !== 'vecthare_multitenancy') {
+                        return res.status(400).json({ error: 'Invalid physical Qdrant collection name' });
+                    }
+                    record = await qdrantBackend.readInitialCollectionConfig(physicalCollectionId, key);
+                } else {
+                    if (physicalCollectionId !== 'vecthare_main') {
+                        return res.status(400).json({ error: 'Invalid physical Milvus collection name' });
+                    }
+                    record = await milvusBackend.readInitialCollectionConfig(key);
+                    if (record !== undefined) {
+                        try { record = JSON.parse(record); }
+                        catch { return res.json({ success: true, status: 'invalid' }); }
+                    }
+                }
+            } else {
+                // Match the existing write path, but do not use getIndex/getCollection:
+                // those accessors can create directories or indexes.
+                let folders;
+                if (backend === 'lancedb') {
+                    if (source === '.' || source === '..' || !/^[a-zA-Z0-9_.-]+$/.test(source)) {
+                        return res.status(400).json({ error: 'Unsafe source' });
+                    }
+                    const table = collectionId.replace(/[^a-zA-Z0-9_.-]/g, '_');
+                    if (!table || table === '.' || table === '..') {
+                        return res.status(400).json({ error: 'Invalid table name' });
+                    }
+                    folders = [path.join(req.user.directories.vectors, 'lancedb', source, `${table}.lance`)];
+                } else {
+                    const safeSource = sanitize(source);
+                    const safeCollection = sanitize(collectionId);
+                    const safeModel = sanitize(model);
+                    if (!safeSource || !safeCollection || (model && !safeModel)) {
+                        return res.status(400).json({ error: 'Invalid collection location' });
+                    }
+                    const base = path.join(req.user.directories.vectors, safeSource, safeCollection);
+                    if (model) {
+                        folders = [path.join(base, safeModel)];
+                    } else {
+                        // Models may have changed since first vectorization. Search only
+                        // this collection's existing model folders; never create indexes.
+                        let entries;
+                        try { entries = await fs.readdir(base, { withFileTypes: true }); }
+                        catch (error) {
+                            if (error.code === 'ENOENT') return res.status(404).json({ error: 'Collection not found' });
+                            throw error;
+                        }
+                        folders = [base, ...entries.filter(entry => entry.isDirectory())
+                            .map(entry => path.join(base, entry.name))];
+                    }
+                }
+                let existing = false;
+                let existingCount = 0;
+                const records = [];
+                for (const folder of folders) {
+                    try {
+                        if (!(await fs.stat(folder)).isDirectory()) continue;
+                        if (backend !== 'lancedb' &&
+                            !(await fs.stat(path.join(folder, 'index.json'))).isFile()) continue;
+                    } catch (error) {
+                        if (error.code === 'ENOENT') continue;
+                        throw error;
+                    }
+                    existing = true;
+                    existingCount++;
+                    let json;
+                    try { json = await fs.readFile(path.join(folder, 'vecthare-initial-config.json'), 'utf8'); }
+                    catch (error) {
+                        if (error.code === 'ENOENT') continue;
+                        throw error;
+                    }
+                    if (Buffer.byteLength(json, 'utf8') > 65536) {
+                        return res.json({ success: true, status: 'invalid' });
+                    }
+                    try { records.push(JSON.parse(json)); }
+                    catch { return res.json({ success: true, status: 'invalid' }); }
+                }
+                if (!existing) return res.status(404).json({ error: 'Collection not found' });
+                // Several physical Vectra indexes mean the model location is ambiguous,
+                // even if only one currently has a provenance file.
+                if ((!model && existingCount > 1) || records.length > 1) {
+                    return res.json({ success: true, status: 'ambiguous' });
+                }
+                record = records[0];
+            }
+            if (record === undefined) return res.json({ success: true, status: 'missing' });
+            return res.json({ success: true, status: 'found', record });
+        } catch (error) {
+            console.error(`[${pluginName}] Could not read initial collection configuration:`, error);
+            res.status(503).json({ error: 'Collection configuration unavailable' });
+        }
+    });
+
     /** GET /api/plugins/similharity/collections — list collections in all backends. */
     router.get('/collections', async (req, res) => {
         try {

@@ -201,6 +201,21 @@ class QdrantBackend {
         }
     }
 
+    /** Read the original configuration without creating or updating a collection. */
+    async readInitialCollectionConfig(physicalName, key) {
+        if (!this.baseUrl) throw new Error('Qdrant not initialized');
+        const name = encodeURIComponent(this._parseCollectionName(physicalName));
+        const info = await this._request('GET', `/collections/${name}`);
+        if (!info?.result?.config || typeof info.result.config !== 'object') {
+            throw new Error('Qdrant returned an invalid collection description');
+        }
+        const metadata = info.result.config.metadata;
+        if (metadata != null && (typeof metadata !== 'object' || Array.isArray(metadata))) {
+            throw new Error('Qdrant returned invalid collection metadata');
+        }
+        return metadata?.[key];
+    }
+
     /** Write-once provenance stored in Qdrant's native collection metadata (1.16+). */
     async saveInitialCollectionConfig(physicalName, key, value) {
         if (!this.baseUrl) throw new Error('Qdrant not initialized');

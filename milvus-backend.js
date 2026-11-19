@@ -75,6 +75,22 @@ class MilvusBackend {
         }
     }
 
+    /** Read a collection property without changing the shared collection. */
+    async readInitialCollectionConfig(key) {
+        if (!this.isConnected || !this.client) throw new Error('Milvus not initialized');
+        const info = await this.client.describeCollection({ collection_name: 'vecthare_main' });
+        if (info?.status && ((info.status.code !== undefined && Number(info.status.code) !== 0) ||
+            (info.status.error_code !== undefined && !['Success', 0, '0'].includes(info.status.error_code)))) {
+            throw new Error(`Milvus describe collection failed: ${info.status.reason || info.status.error_code || info.status.code}`);
+        }
+        if (!info || typeof info !== 'object' || (!info.schema && !info.properties)) {
+            throw new Error('Milvus returned an invalid collection description');
+        }
+        const properties = info.properties ?? info.schema?.properties ?? [];
+        return Array.isArray(properties) ? properties.find(p => p.key === key)?.value
+            : properties[key];
+    }
+
     /** Write-once provenance in properties of the shared Milvus collection. */
     async saveInitialCollectionConfig(key, value) {
         if (!this.isConnected || !this.client) throw new Error('Milvus not initialized');
