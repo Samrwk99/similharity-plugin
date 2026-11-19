@@ -23,6 +23,22 @@ import milvusBackend from './milvus-backend.js';
 const pluginName = 'similharity';
 const pluginVersion = '3.2.0';
 
+// Items in a plain Vectra index folder, or null when the folder holds anything
+// other than index.json (and VectHare's own config file) or cannot be parsed.
+// Used to prove a model folder is empty before a whole-collection purge.
+async function countPlainVectraIndexItems(dir) {
+    const entries = await fs.readdir(dir, { withFileTypes: true });
+    const allowed = new Set(['index.json', 'vecthare-initial-config.json']);
+    if (entries.some(entry => !entry.isFile() || entry.isSymbolicLink() || !allowed.has(entry.name)) ||
+        !entries.some(entry => entry.name === 'index.json')) return null;
+    try {
+        const index = JSON.parse(await fs.readFile(path.join(dir, 'index.json'), 'utf8'));
+        return Array.isArray(index?.items) ? index.items.length : null;
+    } catch {
+        return null;
+    }
+}
+
 /**
  * Initialize the plugin
  * @param {import('express').Router} router - Express router for plugin endpoints
@@ -234,8 +250,15 @@ export async function init(router) {
                                 throw new Error('Unsafe Vectra index directory for scoped purge');
                             }
                         }
-                        const indexFile = await fs.lstat(path.join(folder, 'index.json'));
-                        if (!indexFile.isFile() || indexFile.isSymbolicLink()) {
+                        let indexFile = null;
+                        try {
+                            indexFile = await fs.lstat(path.join(folder, 'index.json'));
+                        } catch (error) {
+                            // A whole collection may hold only model subfolders;
+                            // those are verified below before anything is removed.
+                            if (error.code !== 'ENOENT' || model) throw error;
+                        }
+                        if (indexFile && (!indexFile.isFile() || indexFile.isSymbolicLink())) {
                             throw new Error('Vectra index cannot be verified for scoped purge');
                         }
                         if (model && safeModel !== model) {
@@ -276,11 +299,39 @@ export async function init(router) {
                             }
                         }
                         if (!model) {
-                            // This is the parent of all model subfolders. Even
-                            // an incomplete child index must not be swept up.
+                            // This is the parent of all model subfolders. A child
+                            // is removed with it only when it is provably an EMPTY
+                            // plain index (index.json with no items, optionally
+                            // VectHare's config file, nothing else). Any child that
+                            // holds chunks, or anything unrecognised, blocks the
+                            // purge and is named, so no vectors are ever swept up.
                             const entries = await fs.readdir(folder, { withFileTypes: true });
-                            if (entries.some(entry => entry.isDirectory() || entry.isSymbolicLink())) {
-                                throw new Error('Other model directory exists; scoped purge blocked');
+                            const children = entries.filter(entry => entry.isDirectory() || entry.isSymbolicLink());
+                            const blocking = [];
+                            for (const child of children) {
+                                const count = child.isSymbolicLink() ? null
+                                    : await countPlainVectraIndexItems(path.join(folder, child.name));
+                                if (count !== 0) {
+                                    blocking.push(count === null ? `${child.name}: not a plain index`
+                                        : `${child.name}: ${count} chunk${count === 1 ? '' : 's'}`);
+                                }
+                            }
+                            if (!indexFile && (!children.length || children.length !== entries.length)) {
+                                // No index of its own: only a folder of model
+                                // indexes and nothing else may be removed.
+                                throw new Error('Vectra index cannot be verified for scoped purge');
+                            }
+                            if (blocking.length) {
+                                throw new Error('This collection also holds another embedding model\'s index ' +
+                                    `(${blocking.join('; ')}); scoped purge blocked`);
+                            }
+                            for (const child of children) {
+                                await fs.rm(path.join(folder, child.name), { recursive: true });
+                            }
+                            if (!indexFile) {
+                                // rmdir only succeeds on an empty folder.
+                                await fs.rmdir(folder);
+                                return;
                             }
                         }
                         await new vectra.LocalIndex(folder).deleteIndex();
@@ -616,6 +667,55 @@ export async function init(router) {
     });
 
     /**
+     * POST /api/plugins/similharity/collections/paths
+     * Where a collection and VectHare's metadata document actually live, for
+     * display. READ-ONLY: it resolves, checks and reports; it creates nothing
+     * and returns null for anything it cannot confirm. Remote backends have no
+     * local path and say so.
+     */
+    router.post('/collections/paths', async (req, res) => {
+        try {
+            const { backend = 'vectra', collectionId, source, model } = req.body;
+            if (typeof collectionId !== 'string' || !collectionId || collectionId.length > 255 ||
+                /[\\/]|\.\.|[\u0000-\u001f]/.test(collectionId)) {
+                return res.status(400).json({ error: 'Invalid collectionId' });
+            }
+            const vectorsPath = req.user.directories.vectors;
+            const exists = async target => {
+                try { await fs.stat(target); return true; } catch { return false; }
+            };
+
+            // VectHare's own metadata document, when it has been written.
+            const metadataFile = path.join(vectorsPath, 'vecthare-owned-state', 'collections.json');
+            const metadata = await exists(metadataFile) ? metadataFile : null;
+
+            if (backend === 'qdrant' || backend === 'milvus') {
+                return res.json({ success: true, remote: true, collection: null, metadata });
+            }
+
+            const safeSource = sanitize(String(source || ''));
+            if (!safeSource || safeSource !== String(source || '')) {
+                return res.json({ success: true, remote: false, collection: null, metadata });
+            }
+            let candidate;
+            if (backend === 'lancedb') {
+                candidate = path.join(vectorsPath, 'lancedb', safeSource, `${collectionId}.lance`);
+            } else {
+                const safeModel = sanitize(String(model || ''));
+                candidate = path.join(vectorsPath, safeSource, collectionId,
+                    ...(model && safeModel === String(model) ? [safeModel] : []));
+            }
+            return res.json({
+                success: true, remote: false, metadata,
+                collection: await exists(candidate) ? candidate : null,
+            });
+        } catch (error) {
+            console.error(`[${pluginName}] collections/paths error:`, error);
+            res.status(500).json({ error: error.message });
+        }
+    });
+
+    /**
      * POST /api/plugins/similharity/open-folder
      * Opens collection folder in file explorer
      */
@@ -634,8 +734,14 @@ export async function init(router) {
                 // LanceDB structure: lancedb/{source}/{collectionId}.lance
                 const effectiveSource = source || 'bananabread';
                 folderPath = path.join(vectorsPath, 'lancedb', effectiveSource, `${collectionId}.lance`);
-            } else if (backend === 'qdrant') {
-                return res.status(400).json({ error: 'Qdrant collections are stored remotely' });
+            } else if (backend === 'qdrant' || backend === 'milvus') {
+                // Remote backends have no folder on this machine. Milvus used
+                // to fall through and build a Vectra-shaped path that could
+                // never exist, reporting a confusing "folder not found".
+                return res.status(400).json({
+                    error: `${backend === 'qdrant' ? 'Qdrant' : 'Milvus'} collections are stored on the ` +
+                        'server, not in a folder on this machine',
+                });
             } else {
                 const effectiveSource = source || 'transformers';
                 folderPath = path.join(vectorsPath, effectiveSource, collectionId);
