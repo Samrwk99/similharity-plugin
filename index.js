@@ -704,37 +704,59 @@ export async function init(router) {
             } else {
                 // Match the existing write path, but do not use getIndex/getCollection:
                 // those accessors can create directories or indexes.
-                let folders;
+                let folders = [];
+                const folderSources = new Map();
+                // A saved model may belong to a provider other than the one
+                // selected globally now. Search existing user-owned folders only,
+                // and refuse ambiguous matches below. No index is created.
+                const roots = async base => {
+                    try { return (await fs.readdir(base, { withFileTypes: true }))
+                        .filter(entry => entry.isDirectory()).map(entry => entry.name); }
+                    catch (error) { if (error.code === 'ENOENT') return []; throw error; }
+                };
                 if (backend === 'lancedb') {
-                    if (source === '.' || source === '..' || !/^[a-zA-Z0-9_.-]+$/.test(source)) {
+                    if (source !== '*' && (source === '.' || source === '..' ||
+                        !/^[a-zA-Z0-9_.-]+$/.test(source))) {
                         return res.status(400).json({ error: 'Unsafe source' });
                     }
                     const table = collectionId.replace(/[^a-zA-Z0-9_.-]/g, '_');
                     if (!table || table === '.' || table === '..') {
                         return res.status(400).json({ error: 'Invalid table name' });
                     }
-                    folders = [path.join(req.user.directories.vectors, 'lancedb', source, `${table}.lance`)];
+                    const lanceRoot = path.join(req.user.directories.vectors, 'lancedb');
+                    const sources = source === '*' ? await roots(lanceRoot) : [source];
+                    folders = sources.filter(src => /^[a-zA-Z0-9_.-]+$/.test(src) &&
+                        src !== '.' && src !== '..')
+                        .map(src => {
+                            const folder = path.join(lanceRoot, src, `${table}.lance`);
+                            folderSources.set(folder, src);
+                            return folder;
+                        });
                 } else {
-                    const safeSource = sanitize(source);
                     const safeCollection = sanitize(collectionId);
                     const safeModel = sanitize(model);
-                    if (!safeSource || !safeCollection || (model && !safeModel)) {
+                    if (!safeCollection || (model && !safeModel) ||
+                        (source !== '*' && (!source || sanitize(source) !== source))) {
                         return res.status(400).json({ error: 'Invalid collection location' });
                     }
-                    const base = path.join(req.user.directories.vectors, safeSource, safeCollection);
-                    if (model) {
-                        folders = [path.join(base, safeModel)];
-                    } else {
-                        // Models may have changed since first vectorization. Search only
-                        // this collection's existing model folders; never create indexes.
-                        let entries;
-                        try { entries = await fs.readdir(base, { withFileTypes: true }); }
-                        catch (error) {
-                            if (error.code === 'ENOENT') return res.status(404).json({ error: 'Collection not found' });
-                            throw error;
+                    const vectorsRoot = req.user.directories.vectors;
+                    const sources = source === '*' ? (await roots(vectorsRoot)).filter(src => src !== 'lancedb')
+                        : [source];
+                    for (const src of sources) {
+                        const safeSource = sanitize(src);
+                        if (!safeSource || safeSource !== src) continue;
+                        const base = path.join(vectorsRoot, safeSource, safeCollection);
+                        if (model) {
+                            const folder = path.join(base, safeModel);
+                            folderSources.set(folder, src);
+                            folders.push(folder);
+                        } else {
+                            const models = await roots(base);
+                            for (const folder of [base, ...models.map(name => path.join(base, name))]) {
+                                folderSources.set(folder, src);
+                                folders.push(folder);
+                            }
                         }
-                        folders = [base, ...entries.filter(entry => entry.isDirectory())
-                            .map(entry => path.join(base, entry.name))];
                     }
                 }
                 let existing = false;
@@ -760,8 +782,15 @@ export async function init(router) {
                     if (Buffer.byteLength(json, 'utf8') > 65536) {
                         return res.json({ success: true, status: 'invalid' });
                     }
-                    try { records.push(JSON.parse(json)); }
+                    let parsedRecord;
+                    try { parsedRecord = JSON.parse(json); }
                     catch { return res.json({ success: true, status: 'invalid' }); }
+                    // The record must describe the physical provider folder it
+                    // came from, including when a wildcard location was requested.
+                    if (parsedRecord?.snapshot?.embedding?.provider !== folderSources.get(folder)) {
+                        return res.json({ success: true, status: 'invalid' });
+                    }
+                    records.push(parsedRecord);
                 }
                 if (!existing) return res.status(404).json({ error: 'Collection not found' });
                 // Several physical Vectra indexes mean the model location is ambiguous,

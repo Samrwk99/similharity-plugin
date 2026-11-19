@@ -205,7 +205,15 @@ class QdrantBackend {
     async readInitialCollectionConfig(physicalName, key) {
         if (!this.baseUrl) throw new Error('Qdrant not initialized');
         const name = encodeURIComponent(this._parseCollectionName(physicalName));
-        const info = await this._request('GET', `/collections/${name}`);
+        let info;
+        try {
+            info = await this._request('GET', `/collections/${name}`);
+        } catch (error) {
+            // A genuinely absent collection is normal before its first insert.
+            // Do not mask auth, timeout, or other server failures as absence.
+            if (this._isNotFound(error)) return undefined;
+            throw error;
+        }
         if (!info?.result?.config || typeof info.result.config !== 'object') {
             throw new Error('Qdrant returned an invalid collection description');
         }
