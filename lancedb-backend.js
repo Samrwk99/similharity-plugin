@@ -68,6 +68,10 @@ class LanceDBBackend {
      */
     async getDatabase(source = 'transformers') {
         if (!this.basePath) throw new Error('LanceDB not initialized');
+        // A source is one provider directory, never a request-controlled path.
+        if (typeof source !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(source)) {
+            throw new Error('Invalid embedding source directory');
+        }
 
         // Check cache
         if (this.databases.has(source)) {
@@ -394,24 +398,7 @@ class LanceDBBackend {
      * @returns {Promise<void>}
      */
     async purgeAll() {
-        if (!this.basePath) throw new Error('LanceDB not initialized');
-
-        let totalPurged = 0;
-
-        // Purge from all connected databases
-        for (const [source, db] of this.databases) {
-            const tableNames = await db.tableNames();
-
-            for (const tableName of tableNames) {
-                await db.dropTable(tableName);
-                this.collections.delete(`${source}:${tableName}`);
-                totalPurged++;
-            }
-
-            console.log(`[LanceDB] Purged ${tableNames.length} collections from ${source}`);
-        }
-
-        console.log(`[LanceDB] Purged all ${totalPurged} collections across all sources`);
+        throw new Error('Global LanceDB purge is forbidden; delete verified VectHare tables individually');
     }
 
     /**

@@ -11,9 +11,9 @@
  */
 
 import path from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
-import { exec } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import sanitize from 'sanitize-filename';
 import vectra from 'vectra';
 import lancedbBackend from './lancedb-backend.js';
@@ -43,6 +43,17 @@ export async function init(router) {
             console.log(`[${pluginName}] Auto-initializing LanceDB backend...`);
             await lancedbBackend.initialize(directories.vectors);
         }
+    }
+
+    // This plugin may share SillyTavern's vector directory. A caller must not
+    // be able to write, update or delete a vanilla collection through VectHare.
+    const isVectHareCollection = id => typeof id === 'string' &&
+        /^vecthare_[A-Za-z0-9_.-]+$/.test(id);
+    function requireVectHareCollection(req, res, next) {
+        if (!isVectHareCollection(req.body?.collectionId)) {
+            return res.status(403).json({ error: 'Only VectHare-owned collection IDs may be modified' });
+        }
+        next();
     }
 
     function getBackendHandler(backend) {
@@ -207,10 +218,48 @@ export async function init(router) {
                     },
 
                     purge: async (collectionId, source, model, directories) => {
-                        const store = await getIndex(directories, collectionId, source, model);
-                        if (await store.isIndexCreated()) {
-                            await store.deleteIndex();
+                        // Do not create an index to purge it. Vectra deleteIndex()
+                        // deletes its whole folder; with no model subfolder that
+                        // folder may also contain *other* models' indexes.
+                        const safeModel = sanitize(model);
+                        if (!source || source === '.' || source === '..' ||
+                            sanitize(source) !== source ||
+                            (model && (!safeModel || safeModel === '.' || safeModel === '..'))) {
+                            throw new Error('Unsafe Vectra source/model for scoped purge');
                         }
+                        let folder = directories.vectors;
+                        for (const part of [source, collectionId, ...(model ? [safeModel] : [])]) {
+                            folder = path.join(folder, part);
+                            const entry = await fs.lstat(folder);
+                            if (!entry.isDirectory() || entry.isSymbolicLink()) {
+                                throw new Error('Unsafe Vectra index directory for scoped purge');
+                            }
+                        }
+                        const indexFile = await fs.lstat(path.join(folder, 'index.json'));
+                        if (!indexFile.isFile() || indexFile.isSymbolicLink()) {
+                            throw new Error('Vectra index cannot be verified for scoped purge');
+                        }
+                        if (model && safeModel !== model) {
+                            // Distinct model IDs can sanitize to the same folder.
+                            // Require its saved VectHare provenance to identify
+                            // the requested model before deleting that folder.
+                            const raw = await fs.readFile(path.join(folder, 'vecthare-initial-config.json'), 'utf8');
+                            const config = JSON.parse(raw);
+                            if (config?.collectionId !== collectionId ||
+                                config.snapshot?.embedding?.provider !== source ||
+                                config.snapshot?.embedding?.model !== model) {
+                                throw new Error('Sanitized Vectra model destination is not verified');
+                            }
+                        }
+                        if (!model) {
+                            // This is the parent of all model subfolders. Even
+                            // an incomplete child index must not be swept up.
+                            const entries = await fs.readdir(folder, { withFileTypes: true });
+                            if (entries.some(entry => entry.isDirectory() || entry.isSymbolicLink())) {
+                                throw new Error('Other model directory exists; scoped purge blocked');
+                            }
+                        }
+                        await new vectra.LocalIndex(folder).deleteIndex();
                     },
 
                     stats: async (collectionId, source, model, directories) => {
@@ -564,20 +613,25 @@ export async function init(router) {
             }
 
             folderPath = path.resolve(folderPath);
-
+            // Open Folder is allowed to READ only inside the user's vectors
+            // directory. A path or symlink must not escape that root.
+            let realFolder;
             try {
-                await fs.access(folderPath);
+                realFolder = await fs.realpath(folderPath);
+                if (!(await fs.stat(realFolder)).isDirectory()) throw new Error('Not a directory');
             } catch {
                 return res.status(404).json({ error: `Folder not found: ${folderPath}` });
             }
-
+            const realRoot = await fs.realpath(vectorsPath);
+            if (!realFolder.startsWith(realRoot + path.sep)) {
+                return res.status(403).json({ error: 'Folder is outside the vectors directory' });
+            }
             const platform = process.platform;
-            const cmd = platform === 'win32' ? `start "" "${folderPath}"`
-                : platform === 'darwin' ? `open "${folderPath}"`
-                : `xdg-open "${folderPath}"`;
-
-            exec(cmd, { shell: true });
-            res.json({ success: true, path: folderPath });
+            const command = platform === 'win32' ? 'explorer.exe' : platform === 'darwin' ? 'open' : 'xdg-open';
+            const child = spawn(command, [realFolder], { shell: false, detached: true, stdio: 'ignore' });
+            child.on('error', error => console.warn(`[${pluginName}] Open folder failed:`, error.message));
+            child.unref();
+            res.json({ success: true, path: realFolder });
 
         } catch (error) {
             console.error(`[${pluginName}] open-folder error:`, error);
@@ -585,10 +639,195 @@ export async function init(router) {
         }
     });
 
+    // Stage 13.0: compact, VectHare-owned source-identity ledger. Never write
+    // into ST chat files or modify a vanilla-generated index.
+    function identityLedgerPath(req, collectionId, binding) {
+        if (!isVectHareCollection(collectionId) || !binding ||
+            !['standard', 'vectra', 'lancedb', 'qdrant', 'milvus'].includes(binding.backend) ||
+            typeof binding.source !== 'string' || !binding.source ||
+            typeof binding.model !== 'string' || !binding.storage ||
+            typeof binding.storage !== 'object') {
+            throw new Error('Invalid VectHare identity ledger destination');
+        }
+        const root = path.join(req.user.directories.vectors, 'vecthare-owned-identity-ledgers');
+        const key = createHash('sha256')
+            .update(JSON.stringify([collectionId, binding])).digest('hex');
+        return { root, filename: path.join(root, `${key}.json`) };
+    }
+
+    async function ensureIdentityLedgerDirectory(root) {
+        await fs.mkdir(root, { recursive: true });
+        const stat = await fs.lstat(root);
+        const parent = await fs.realpath(path.dirname(root));
+        if (!stat.isDirectory() || stat.isSymbolicLink() ||
+            await fs.realpath(root) !== path.join(parent, 'vecthare-owned-identity-ledgers')) {
+            throw new Error('Unsafe VectHare identity ledger storage directory');
+        }
+    }
+
+    function validateIdentityLedger(ledger, collectionId, binding) {
+        if (!ledger || ledger.version !== 1 || ledger.collectionId !== collectionId ||
+            JSON.stringify(ledger.binding) !== JSON.stringify(binding) ||
+            !['clean', 'dirty'].includes(ledger.state) ||
+            (ledger.state === 'clean' && ledger.pending != null) ||
+            !Array.isArray(ledger.messages) || !Array.isArray(ledger.groups) ||
+            (ledger.state === 'dirty' && (!ledger.pending ||
+                !Array.isArray(ledger.pending.insertHashes) || !Array.isArray(ledger.pending.deleteHashes)))) {
+            throw new Error('Invalid or mismatched identity ledger');
+        }
+        const uids = new Set();
+        for (const msg of ledger.messages) {
+            if (typeof msg.uid !== 'string' || !/^m_[0-9a-f]{32}$/.test(msg.uid) ||
+                uids.has(msg.uid) || typeof msg.fingerprint !== 'string' ||
+                !/^[0-9a-f]{64}$/.test(msg.fingerprint) ||
+                !Number.isSafeInteger(msg.position) || msg.position < 0 ||
+                typeof msg.role !== 'string' || typeof msg.name !== 'string' ||
+                (msg.retiredConfirmed !== undefined && typeof msg.retiredConfirmed !== 'boolean')) {
+                throw new Error('Invalid identity ledger message');
+            }
+            uids.add(msg.uid);
+        }
+        for (const group of ledger.groups) {
+            if (!Array.isArray(group.memberUids) || !group.memberUids.length ||
+                !group.memberUids.every(uid => uids.has(uid)) ||
+                (group.provenanceUids !== undefined &&
+                    (!Array.isArray(group.provenanceUids) ||
+                        !group.provenanceUids.length ||
+                        new Set(group.provenanceUids).size !== group.provenanceUids.length ||
+                        !group.provenanceUids.every(uid =>
+                            typeof uid === 'string' && /^m_[0-9a-f]{32}$/.test(uid)))) ||
+                !['string', 'number'].includes(typeof group.hash) ||
+                !/^[0-9a-f]{64}$/.test(group.hashInputFingerprint) ||
+                typeof group.indexed !== 'boolean') {
+                throw new Error('Invalid identity ledger group');
+            }
+        }
+    }
+
+    router.post('/identity-ledger/read', requireVectHareCollection, async (req, res) => {
+        try {
+            const { collectionId, binding } = req.body;
+            const { filename } = identityLedgerPath(req, collectionId, binding);
+            let ledger;
+            try { ledger = JSON.parse(await fs.readFile(filename, 'utf8')); }
+            catch (error) {
+                if (error.code === 'ENOENT') return res.json({ success: true, status: 'missing' });
+                return res.json({ success: true, status: 'invalid' });
+            }
+            try { validateIdentityLedger(ledger, collectionId, binding); }
+            catch { return res.json({ success: true, status: 'invalid' }); }
+            return res.json({ success: true, status: 'found', ledger });
+        } catch (error) {
+            return res.status(400).json({ error: error.message });
+        }
+    });
+
+    router.post('/identity-ledger/save', requireVectHareCollection, async (req, res) => {
+        let temporary = null;
+        try {
+            const { collectionId, binding, ledger } = req.body;
+            const { root, filename } = identityLedgerPath(req, collectionId, binding);
+            if (ledger !== null) validateIdentityLedger(ledger, collectionId, binding);
+            // Null means explicitly invalidating tracking after a confirmed purge.
+            if (ledger === null) {
+                // The invalidate path must meet the same anti-symlink rule as
+                // writes, even when the directory was replaced by another app.
+                try { await fs.lstat(root); await ensureIdentityLedgerDirectory(root); }
+                catch (error) {
+                    if (error.code === 'ENOENT') return res.json({ success: true });
+                    throw error;
+                }
+                await fs.unlink(filename).catch(error => {
+                    if (error.code !== 'ENOENT') throw error;
+                });
+                return res.json({ success: true });
+            }
+            const serialized = JSON.stringify(ledger);
+            if (Buffer.byteLength(serialized, 'utf8') > 16 * 1024 * 1024) {
+                return res.status(413).json({ error: 'Identity ledger too large' });
+            }
+            await ensureIdentityLedgerDirectory(root);
+            temporary = path.join(root, `${path.basename(filename)}.${randomUUID()}.tmp`);
+            await fs.writeFile(temporary, serialized, { flag: 'wx', encoding: 'utf8' });
+            await fs.rename(temporary, filename);
+            temporary = null;
+            return res.json({ success: true });
+        } catch (error) {
+            return res.status(400).json({ error: error.message });
+        } finally {
+            if (temporary) await fs.unlink(temporary).catch(() => {});
+        }
+    });
+
+    // A small, durable VectHare-owned purge intent. Standard's native purge
+    // removes its initial-config file; this record survives a browser reload
+    // so an interrupted ledger cleanup can be finished without guessing a
+    // source/model or deleting any additional vectors.
+    router.post('/identity-ledger/purge-recovery', requireVectHareCollection, async (req, res) => {
+        let temporary = null;
+        try {
+            const { collectionId, action, record } = req.body;
+            const root = path.join(req.user.directories.vectors, 'vecthare-owned-identity-ledgers');
+            const filename = path.join(root, `purge-${createHash('sha256').update(collectionId).digest('hex')}.json`);
+            const validate = value => {
+                if (!value || value.version !== 1 || value.collectionId !== collectionId ||
+                    !['standard', 'vectra'].includes(value.backend) ||
+                    typeof value.source !== 'string' || !value.source || value.source.length > 256 ||
+                    typeof value.modelFolder !== 'string' || value.modelFolder.length > 256 ||
+                    value.destination !== JSON.stringify([value.backend, value.source, value.modelFolder]) ||
+                    typeof value.originalRecordedAt !== 'string' ||
+                    !Number.isFinite(Date.parse(value.originalRecordedAt)) ||
+                    value.binding?.backend !== value.backend || value.binding?.source !== value.source) {
+                    throw new Error('Invalid Standard purge recovery record');
+                }
+                identityLedgerPath(req, collectionId, value.binding);
+            };
+            const read = async () => {
+                try { await fs.lstat(root); }
+                catch (error) { if (error.code === 'ENOENT') return { status: 'missing' }; throw error; }
+                await ensureIdentityLedgerDirectory(root);
+                let stat;
+                try { stat = await fs.lstat(filename); }
+                catch (error) { if (error.code === 'ENOENT') return { status: 'missing' }; throw error; }
+                if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 65536) return { status: 'invalid' };
+                try {
+                    const saved = JSON.parse(await fs.readFile(filename, 'utf8'));
+                    validate(saved);
+                    return { status: 'found', record: saved };
+                } catch { return { status: 'invalid' }; }
+            };
+            if (action === 'read') return res.json({ success: true, ...await read() });
+            if (!['prepare', 'clear'].includes(action)) throw new Error('Invalid recovery action');
+            validate(record);
+            const current = await read();
+            if (current.status === 'invalid') throw new Error('Stored purge recovery record is invalid');
+            if (current.status === 'found' && JSON.stringify(current.record) !== JSON.stringify(record)) {
+                throw new Error('A different Standard destination has pending cleanup');
+            }
+            if (action === 'clear') {
+                if (current.status === 'found') await fs.unlink(filename);
+                return res.json({ success: true });
+            }
+            if (current.status === 'found') return res.json({ success: true });
+            await ensureIdentityLedgerDirectory(root);
+            const serialized = JSON.stringify(record);
+            if (Buffer.byteLength(serialized, 'utf8') > 65536) throw new Error('Purge recovery record too large');
+            temporary = path.join(root, `${path.basename(filename)}.${randomUUID()}.tmp`);
+            await fs.writeFile(temporary, serialized, { flag: 'wx', encoding: 'utf8' });
+            await fs.rename(temporary, filename);
+            temporary = null;
+            return res.json({ success: true });
+        } catch (error) {
+            return res.status(400).json({ error: error.message });
+        } finally {
+            if (temporary) await fs.unlink(temporary).catch(() => {});
+        }
+    });
+
     /** Store initial vectorization provenance alongside the backend collection.
      * This endpoint never changes vectors and never replaces a saved record.
      */
-    router.post('/collections/initial-config', async (req, res) => {
+    router.post('/collections/initial-config', requireVectHareCollection, async (req, res) => {
         try {
             const { backend = 'standard', collectionId, physicalCollectionId,
                 source = 'transformers', model = '', snapshot } = req.body || {};
@@ -1290,7 +1529,7 @@ async function _getLegacySingleEmbedding(source, text, model, directories, req) 
      * Insert new chunks
      * Body: { backend, collectionId, items: [{hash, text, index, metadata?, vector?}], source?, model? }
      */
-    router.post('/chunks/insert', async (req, res) => {
+    router.post('/chunks/insert', requireVectHareCollection, async (req, res) => {
         try {
             const {
                 backend = 'vectra',
@@ -1312,8 +1551,38 @@ async function _getLegacySingleEmbedding(source, text, model, directories, req) 
                 await ensureLanceDBInitialized(req.user.directories);
             }
 
+            // The endpoint also accepts direct plugin callers (not just the
+            // VectHare extension). Preserve supplied provenance exactly; only
+            // otherwise stamp a clearly *unverified* API-origin record.
+            // Never change hashes, vectors, text or grouping.
+            const submitted = !Array.isArray(items) ? items : items.map(item => {
+                if (item?.metadata?.vecthareProvenance != null) return item;
+                const meta = item?.metadata || {};
+                const provenance = {
+                    version: 1,
+                    writer: 'api-insert',
+                    recordKind: 'api-insert',
+                    sourceType: meta.contentType || (meta.isScene ? 'scene' : 'unknown'),
+                    collectionId,
+                    chunkUid: `chunk_${randomUUID()}`,
+                    chunkUidStatus: 'provisional',
+                    groupingStrategy: meta.strategy || 'unknown',
+                    groupingVersion: 'legacy',
+                    sourceIdentity: { status: 'unverified', messageUids: [] },
+                };
+                if (meta.chunkIndex != null) provenance.segmentIndex = meta.chunkIndex;
+                else if (item.index != null) provenance.segmentIndex = item.index;
+                if (meta.entryUid != null) provenance.entryUid = meta.entryUid;
+                if (meta.sourceName != null) provenance.sourceLabel = meta.sourceName;
+                if (typeof item.text === 'string') {
+                    provenance.submittedTextFingerprint = 'sha256:' + createHash('sha256')
+                        .update(item.text).digest('hex');
+                }
+                return { ...item, metadata: { ...meta, vecthareProvenance: provenance } };
+            });
+
             const handler = getBackendHandler(backend);
-            await handler.insert(collectionId, items, source, model, req.user.directories, req, filters);
+            await handler.insert(collectionId, submitted, source, model, req.user.directories, req, filters);
 
             res.json({
                 success: true,
@@ -1333,7 +1602,7 @@ async function _getLegacySingleEmbedding(source, text, model, directories, req) 
      * Update chunk text (triggers re-embedding)
      * Body: { backend, collectionId, text, source?, model? }
      */
-    router.patch('/chunks/:hash/text', async (req, res) => {
+    router.patch('/chunks/:hash/text', requireVectHareCollection, async (req, res) => {
         try {
             const { hash } = req.params;
             const {
@@ -1373,7 +1642,7 @@ async function _getLegacySingleEmbedding(source, text, model, directories, req) 
      * Update chunk metadata (no re-embedding)
      * Body: { backend, collectionId, metadata, source?, model? }
      */
-    router.patch('/chunks/:hash/metadata', async (req, res) => {
+    router.patch('/chunks/:hash/metadata', requireVectHareCollection, async (req, res) => {
         try {
             const { hash } = req.params;
             const {
@@ -1413,7 +1682,7 @@ async function _getLegacySingleEmbedding(source, text, model, directories, req) 
      * Delete chunks by hash
      * Body: { backend, collectionId, hashes, source?, model? }
      */
-    router.post('/chunks/delete', async (req, res) => {
+    router.post('/chunks/delete', requireVectHareCollection, async (req, res) => {
         try {
             const {
                 backend = 'vectra',
@@ -1628,7 +1897,7 @@ async function _getLegacySingleEmbedding(source, text, model, directories, req) 
      * Purge all chunks in a collection
      * Body: { backend, collectionId, source?, model? }
      */
-    router.post('/chunks/purge', async (req, res) => {
+    router.post('/chunks/purge', requireVectHareCollection, async (req, res) => {
         try {
             const {
                 backend = 'vectra',
@@ -1648,6 +1917,29 @@ async function _getLegacySingleEmbedding(source, text, model, directories, req) 
 
             const handler = getBackendHandler(backend);
             await handler.purge(collectionId, source, model, req.user.directories, filters);
+            // Purge invalidates only VectHare-owned identity records. No ST
+            // chat file, settings file or vanilla vector index is touched.
+            // Only a whole-collection purge drops the ledger. A filtered purge leaves the
+            // collection (and its saved identity marker) in place, so its ledger must stay;
+            // stale `indexed` entries are re-verified against the backend before use.
+            if (!filters || !Object.keys(filters).length) {
+                const ledgerRoot = path.join(req.user.directories.vectors, 'vecthare-owned-identity-ledgers');
+                try { await fs.lstat(ledgerRoot); await ensureIdentityLedgerDirectory(ledgerRoot); }
+                catch (error) { if (error.code !== 'ENOENT') throw error; }
+                const files = await fs.readdir(ledgerRoot).catch(error => {
+                    if (error.code === 'ENOENT') return [];
+                    throw error;
+                });
+                for (const name of files) {
+                    if (!/^[a-f0-9]{64}\.json$/.test(name)) continue;
+                    const filename = path.join(ledgerRoot, name);
+                    const stored = await fs.readFile(filename, 'utf8').then(JSON.parse).catch(() => null);
+                    if (stored?.collectionId === collectionId &&
+                        stored.binding?.backend === backend &&
+                        stored.binding?.source === source &&
+                        stored.binding?.model === model) await fs.unlink(filename);
+                }
+            }
 
             res.json({
                 success: true,
@@ -1662,20 +1954,9 @@ async function _getLegacySingleEmbedding(source, text, model, directories, req) 
         }
     });
 
-    /**
-     * POST /api/plugins/similharity/purge-all
-     * Deletes the entire vectors folder
-     */
-    router.post('/purge-all', async (req, res) => {
-        try {
-            const vectorsPath = req.user.directories.vectors;
-            await fs.rm(vectorsPath, { recursive: true, force: true });
-            await fs.mkdir(vectorsPath, { recursive: true });
-            res.json({ success: true, message: 'All vectors purged' });
-        } catch (error) {
-            console.error(`[${pluginName}] purge-all error:`, error);
-            res.status(500).json({ error: error.message });
-        }
+    /** The shared vectors directory also contains SillyTavern-owned data. */
+    router.post('/purge-all', (_req, res) => {
+        res.status(403).json({ error: 'Global vector purge is unsafe; purge verified VectHare collections individually' });
     });
 
     /**
