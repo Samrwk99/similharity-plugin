@@ -201,6 +201,28 @@ class QdrantBackend {
         }
     }
 
+    /** Write-once provenance stored in Qdrant's native collection metadata (1.16+). */
+    async saveInitialCollectionConfig(physicalName, key, value) {
+        if (!this.baseUrl) throw new Error('Qdrant not initialized');
+        const name = encodeURIComponent(this._parseCollectionName(physicalName));
+        const endpoint = `/collections/${name}`;
+        const info = await this._request('GET', endpoint);
+        const metadata = info?.result?.config?.metadata || {};
+        if (metadata[key] !== undefined) {
+            if (metadata[key]?.collectionId !== value.collectionId ||
+                metadata[key]?.snapshot?.schemaVersion !== 1) {
+                throw new Error('Existing Qdrant initial configuration is invalid or belongs to another collection');
+            }
+            return false;
+        }
+        await this._request('PATCH', endpoint, { metadata: { [key]: value } });
+        const written = (await this._request('GET', endpoint))?.result?.config?.metadata?.[key];
+        if (JSON.stringify(written) !== JSON.stringify(value)) {
+            throw new Error('Qdrant did not return the persisted initial configuration (requires Qdrant 1.16+)');
+        }
+        return true;
+    }
+
     /**
      * Health check
      * @returns {Promise<boolean>}

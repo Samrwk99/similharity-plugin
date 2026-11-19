@@ -11,6 +11,7 @@
  */
 
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import { exec } from 'node:child_process';
 import sanitize from 'sanitize-filename';
@@ -584,10 +585,94 @@ export async function init(router) {
         }
     });
 
-    /**
-     * GET /api/plugins/similharity/collections
-     * Lists ALL collections across ALL backends
+    /** Store initial vectorization provenance alongside the backend collection.
+     * This endpoint never changes vectors and never replaces a saved record.
      */
+    router.post('/collections/initial-config', async (req, res) => {
+        try {
+            const { backend = 'standard', collectionId, physicalCollectionId,
+                source = 'transformers', model = '', snapshot } = req.body || {};
+            if (typeof collectionId !== 'string' || !collectionId ||
+                !snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot) ||
+                snapshot.schemaVersion !== 1 || snapshot.storage?.backend !== backend ||
+                snapshot.embedding?.provider !== source) {
+                return res.status(400).json({ error: 'Invalid initial collection configuration' });
+            }
+            const record = { collectionId, snapshot };
+            const json = JSON.stringify(record, null, 2);
+            if (Buffer.byteLength(json, 'utf8') > 65536) return res.status(413).json({ error: 'Configuration too large' });
+
+            let saved = false;
+            if (backend === 'qdrant' || backend === 'milvus') {
+                // Different logical collections can share one physical vector store.
+                const key = `vecthare_initial_${createHash('sha256').update(collectionId).digest('hex')}`;
+                if (backend === 'qdrant') {
+                    if (physicalCollectionId !== collectionId &&
+                        physicalCollectionId !== 'vecthare_multitenancy') {
+                        return res.status(400).json({ error: 'Invalid physical Qdrant collection name' });
+                    }
+                    saved = await qdrantBackend.saveInitialCollectionConfig(physicalCollectionId, key, record);
+                } else {
+                    saved = await milvusBackend.saveInitialCollectionConfig(key, record);
+                }
+            } else if (['standard', 'vectra', 'lancedb'].includes(backend)) {
+                const segment = (value) => {
+                    if (typeof value !== 'string' || !value || value === '.' || value === '..' ||
+                        !/^[a-zA-Z0-9_.-]+$/.test(value)) {
+                        throw new Error('Unsafe collection storage path component');
+                    }
+                    return value;
+                };
+                let folder;
+                if (backend === 'lancedb') {
+                    await ensureLanceDBInitialized(req.user.directories);
+                    // Use the same table-name conversion as lancedb-backend.js.
+                    const table = collectionId.replace(/[^a-zA-Z0-9_.-]/g, '_');
+                    const safeSource = segment(source);
+                    if (!await lancedbBackend.getCollection(collectionId, source)) {
+                        return res.status(409).json({ error: 'LanceDB table does not exist' });
+                    }
+                    folder = path.join(req.user.directories.vectors, 'lancedb', safeSource, `${segment(table)}.lance`);
+                } else {
+                    const parts = [req.user.directories.vectors, sanitize(source), sanitize(collectionId)];
+                    if (model) parts.push(sanitize(model));
+                    folder = path.join(...parts);
+                    // Do not call getIndex here: it creates missing indexes.
+                    // Provenance must attach only to a real, written collection.
+                    try {
+                        if (!(await fs.stat(path.join(folder, 'index.json'))).isFile()) {
+                            throw new Error('Vectra index missing');
+                        }
+                    } catch {
+                        return res.status(409).json({ error: 'Vectra collection does not exist' });
+                    }
+                }
+                if (!(await fs.stat(folder)).isDirectory()) {
+                    return res.status(409).json({ error: 'Collection storage directory missing' });
+                }
+                const filename = path.join(folder, 'vecthare-initial-config.json');
+                try {
+                    // Exclusive creation prevents accidental overwrites.
+                    await fs.writeFile(filename, json, { encoding: 'utf8', flag: 'wx' });
+                    saved = true;
+                } catch (error) {
+                    if (error.code !== 'EEXIST') throw error;
+                    const original = JSON.parse(await fs.readFile(filename, 'utf8'));
+                    if (original.collectionId !== collectionId || original.snapshot?.schemaVersion !== 1) {
+                        throw new Error('Existing collection configuration is invalid or belongs to another collection');
+                    }
+                }
+            } else {
+                return res.status(400).json({ error: 'Unsupported vector backend' });
+            }
+            res.json({ success: true, saved });
+        } catch (error) {
+            console.error(`[${pluginName}] Could not store initial collection configuration:`, error);
+            res.status(500).json({ error: error.message });
+        }
+    });
+
+    /** GET /api/plugins/similharity/collections — list collections in all backends. */
     router.get('/collections', async (req, res) => {
         try {
             const vectorsPath = req.user.directories.vectors;

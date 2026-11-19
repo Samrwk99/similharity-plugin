@@ -75,6 +75,41 @@ class MilvusBackend {
         }
     }
 
+    /** Write-once provenance in properties of the shared Milvus collection. */
+    async saveInitialCollectionConfig(key, value) {
+        if (!this.isConnected || !this.client) throw new Error('Milvus not initialized');
+        const name = 'vecthare_main';
+        const getProperty = async () => {
+            const info = await this.client.describeCollection({ collection_name: name });
+            if (info?.status?.error_code && info.status.error_code !== 'Success') {
+                throw new Error(`Milvus describe collection failed: ${info.status.reason || info.status.error_code}`);
+            }
+            const properties = info?.properties ?? info?.schema?.properties ?? [];
+            if (Array.isArray(properties)) return properties.find(p => p.key === key)?.value;
+            return properties[key];
+        };
+        const existing = await getProperty();
+        if (existing !== undefined) {
+            const original = JSON.parse(existing);
+            if (original.collectionId !== value.collectionId || original.snapshot?.schemaVersion !== 1) {
+                throw new Error('Existing Milvus initial configuration is invalid or belongs to another collection');
+            }
+            return false;
+        }
+        const encoded = JSON.stringify(value);
+        const status = await this.client.alterCollectionProperties({
+            collection_name: name, properties: { [key]: encoded },
+        });
+        if (status && ((status.code !== undefined && Number(status.code) !== 0) ||
+            (status.error_code !== undefined && !['Success', 0, '0'].includes(status.error_code)))) {
+            throw new Error(`Milvus refused collection metadata: ${status.reason || status.error_code}`);
+        }
+        if (await getProperty() !== encoded) {
+            throw new Error('Milvus did not return the persisted initial configuration');
+        }
+        return true;
+    }
+
     /**
      * Health check
      * @returns {Promise<boolean>}
