@@ -7,12 +7,13 @@
  * All chunk operations go through unified /chunks/* endpoints.
  * Backend is specified via `backend` parameter in request body.
  *
- * @version 3.2.0
+ * @version see package.json
  */
 
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import dns from 'node:dns/promises';
 import net from 'node:net';
@@ -31,7 +32,16 @@ import milvusBackend, { ALL_TENANTS, parseMilvusTenant, normalizeMilvusTenant } 
 import { toSafeHashList, requireSafeHash, isSafeFilterString } from './safe-values.js';
 
 const pluginName = 'similharity';
-const pluginVersion = '3.2.0';
+// One source for the version: package.json. VectHare shows it beside its own
+// version; plugin and extension are released with the same version number.
+const pluginVersion = (() => {
+    try { return String(JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version || '0.0.0'); } catch { return '0.0.0'; }
+})();
+// Compatibility number for the extension <-> plugin contract (routes, request
+// and answer shapes, safety rules). Raise it ONLY when that contract changes in
+// a way an older extension or plugin cannot handle; VectHare declares the
+// number it needs (core/plugin-health.js PLUGIN_PROTOCOL) and shows a mismatch.
+const PLUGIN_PROTOCOL = 1;
 
 // Items in a plain Vectra index folder, or null when the folder holds anything
 // other than index.json (and VectHare's own config file) or cannot be parsed.
@@ -824,6 +834,8 @@ export async function init(router) {
 
                     purge: async (collectionId, source, model, directories) => {
                         // VH-094: SillyTavern's folder (moving older plugin data there first).
+                        // The saved provenance records the model VectHare asked for.
+                        const requestedModel = model ? String(model) : '';
                         model = await vectraScopedModel(directories, collectionId, source, model);
                         // Do not create an index to purge it. Vectra deleteIndex()
                         // deletes its whole folder; with no model subfolder that
@@ -867,7 +879,7 @@ export async function init(router) {
                             if (config) {
                                 if (config.collectionId !== collectionId ||
                                     config.snapshot?.embedding?.provider !== source ||
-                                    config.snapshot?.embedding?.model !== model) {
+                                    ![model, requestedModel].includes(config.snapshot?.embedding?.model ?? '')) {
                                     throw new Error('Sanitized Vectra model destination is not verified');
                                 }
                             } else {
@@ -1265,6 +1277,7 @@ export async function init(router) {
             status: 'ok',
             plugin: pluginName,
             version: pluginVersion,
+            protocol: PLUGIN_PROTOCOL,
             backends: ['vectra', 'lancedb', 'qdrant', 'milvus'],
             capabilities: { ownedStateTokens: 1, ledgerTokens: 1, leases: 1, storageReport: 1, scopedTenancy: V2_CAPABILITY },
         });
@@ -1310,7 +1323,7 @@ export async function init(router) {
                     ? await vectraScopedModel(req.user.directories, collectionId, safeSource, String(model || '')) : String(model || '');
                 const safeModel = sanitize(scoped);
                 candidate = path.join(vectorsPath, safeSource, collectionId,
-                    ...(scoped && safeModel === scoped ? [safeModel] : []));
+                    ...(safeModel ? [safeModel] : []));
             }
             return res.json({
                 success: true, remote: false, metadata,
@@ -2208,7 +2221,8 @@ export async function init(router) {
             const safeCollection = sanitize(String(collectionId));
             const safeSource = sanitize(String(source || ''));
             if (safeSource && safeSource === String(source) && safeCollection && (model || await stVectraModelScope(String(source), ''))) {
-                model = await vectraScopedModel(req.user.directories, collectionId, String(source), model ? String(model) : '');
+                // The folder name is the sanitized model (SillyTavern's names can contain "/").
+                model = sanitize(await vectraScopedModel(req.user.directories, collectionId, String(source), model ? String(model) : ''));
             }
             const safeModel = sanitize(String(model || ''));
             if (!safeCollection || !safeSource || safeSource !== String(source) ||
