@@ -1,0 +1,33 @@
+name: Mirror to Similharity-VectHare-Plugin
+
+on:
+  push:
+    branches:
+      - Similharity-VH-main
+      - Similharity-VH-dev
+  workflow_dispatch:
+
+concurrency:
+  group: mirror-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Force-push to matching branch in Similharity-VectHare-Plugin
+        env:
+          TOKEN: ${{ secrets.SIMILHARITY_PLUGIN_TOKEN }}
+        run: |
+          case "${GITHUB_REF_NAME}" in
+            Similharity-VH-main) TARGET=main ;;
+            Similharity-VH-dev)  TARGET=dev ;;
+            *) echo "Unexpected branch: ${GITHUB_REF_NAME}"; exit 1 ;;
+          esac
+          git push --force \
+            "https://x-access-token:${TOKEN}@github.com/Samrwk99/Similharity-VectHare-Plugin.git" \
+            "HEAD:refs/heads/${TARGET}"
