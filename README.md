@@ -1,1 +1,1061 @@
+# Similharity Server Plugin
 
+**Version 2.0.0**
+
+Server-side plugin for [the VectHare](https://github.com/Conejachibi/VectHare) extension that provides enhanced vector database backends and full metadata storage capabilities.
+
+---
+
+## Features
+
+- **LanceDB Backend** - Disk-based vector storage with Apache Arrow format
+- **Qdrant Backend** - High-performance vector search with multitenancy support (requires Qdrant 1.15 or newer: saved collection settings live in collection metadata)
+- **Enhanced Vectra** - Full metadata storage (bypasses ST's hash/text/index limitation)
+- **Collection Browser** - List all collections across all backends
+- **Folder Explorer** - Open collection folders directly from UI
+
+---
+
+## Installation
+
+### Step 1: Enable Server Plugins
+
+Add to your `config.yaml` (in SillyTavern root folder):
+
+```yaml
+enableServerPlugins: true
+```
+
+### Step 2: Install Plugin via Git (RECOMMENDED)
+
+**This method enables automatic updates!**
+
+Open a terminal/command prompt in your SillyTavern folder and run:
+
+```bash
+cd plugins
+git clone -b Similharity-Plugin https://github.com/Coneja-Chibi/VectHare.git similharity
+cd similharity
+npm install
+```
+
+Your folder structure should now look like:
+```
+SillyTavern/
+└── plugins/
+    └── similharity/
+        ├── .git/          <-- THIS IS IMPORTANT FOR AUTO-UPDATES
+        ├── index.js
+        ├── package.json
+        ├── lancedb-backend.js
+        ├── qdrant-backend.js
+        └── README.md
+```
+
+### Step 3: Restart SillyTavern
+
+Check console for:
+```
+[similharity] Initializing v3.0.0...
+[similharity] Plugin initialized successfully
+```
+
+---
+
+## Auto-Updates
+
+**If you installed via `git clone` (Step 2 above)**, the plugin will automatically update every time you restart SillyTavern!
+
+SillyTavern runs `git pull` on all plugin folders that are git repositories on startup. This is enabled by default.
+
+### Verify Auto-Update is Working
+
+1. Check that `.git` folder exists inside `plugins/similharity/`
+2. On startup, look for this message in console:
+   ```
+   Auto-updating server plugins...
+   ```
+
+### If You Downloaded Manually (ZIP)
+
+If you downloaded the plugin as a ZIP file instead of using `git clone`, auto-updates **will not work**. To fix this:
+
+1. Delete the `plugins/similharity` folder
+2. Follow Step 2 above to reinstall via git
+3. Your settings and data are stored separately and won't be lost
+
+### Disable Auto-Updates (Optional)
+
+If you want to disable auto-updates, add to `config.yaml`:
+
+```yaml
+enableServerPluginsAutoUpdate: false
+```
+
+---
+
+## API Endpoints
+
+All endpoints are prefixed with `/api/plugins/similharity`
+
+### Health Check
+
+#### `GET /health`
+
+Returns plugin status and capabilities.
+
+**Response:**
+```json
+{
+  "status": "ok",
+  "plugin": "similharity",
+  "version": "2.0.0",
+  "features": [
+    "vectra-full-metadata",
+    "lancedb",
+    "qdrant",
+    "collection-browser",
+    "folder-explorer"
+  ]
+}
+```
+
+---
+
+## Collection Management
+
+### List All Collections
+
+#### `GET /collections`
+
+Scans all vector backends (Standard/Vectra, LanceDB, Qdrant) and returns unified collection list.
+
+**Response:**
+```json
+{
+  "success": true,
+  "count": 3,
+  "collections": [
+    {
+      "id": "similharity_chat_Alice",
+      "source": "transformers",
+      "backend": "standard",
+      "chunkCount": 150,
+      "modelCount": 1
+    },
+    {
+      "id": "similharity_lore_WorldInfo",
+      "source": "lancedb",
+      "backend": "lancedb",
+      "chunkCount": 500,
+      "modelCount": 1
+    },
+    {
+      "id": "similharity_global",
+      "source": "qdrant",
+      "backend": "qdrant",
+      "chunkCount": 1000,
+      "modelCount": 1
+    }
+  ]
+}
+```
+
+### Get Collection Info
+
+#### `GET /collection/:id?source=transformers`
+
+Returns detailed info about a specific collection.
+
+**Parameters:**
+- `id` (path) - Collection ID
+- `source` (query) - Embedding source (default: `transformers`)
+
+**Response:**
+```json
+{
+  "success": true,
+  "info": {
+    "id": "similharity_chat_Alice",
+    "source": "transformers",
+    "exists": true,
+    "models": [
+      {
+        "name": "Xenova_all-MiniLM-L6-v2",
+        "size": 524288
+      }
+    ],
+    "totalChunks": 150,
+    "totalSize": 524288
+  }
+}
+```
+
+### List Embedding Sources
+
+#### `GET /sources`
+
+Lists all available embedding sources in the vectors directory.
+
+**Response:**
+```json
+{
+  "success": true,
+  "count": 3,
+  "sources": ["transformers", "openai", "palm"]
+}
+```
+
+### Open Collection Folder
+
+#### `POST /open-folder`
+
+Opens the collection folder in file explorer (platform-specific).
+
+**Request:**
+```json
+{
+  "collectionId": "similharity_chat_Alice",
+  "backend": "standard"
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "path": "C:/ST/data/vectors/transformers/similharity_chat_Alice"
+}
+```
+
+**Note:** Qdrant collections have no local folder (remote storage).
+
+---
+
+## LanceDB Backend
+
+### Initialize
+
+#### `POST /lancedb/init`
+
+Initializes LanceDB database connection.
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "LanceDB initialized"
+}
+```
+
+### Health Check
+
+#### `GET /lancedb/health`
+
+Checks LanceDB connection health.
+
+**Response:**
+```json
+{
+  "success": true,
+  "healthy": true
+}
+```
+
+### Insert Vectors
+
+#### `POST /lancedb/insert`
+
+Inserts vectors with full metadata into a collection.
+
+**Request:**
+```json
+{
+  "collectionId": "similharity_chat_Alice",
+  "items": [
+    {
+      "hash": "abc123",
+      "text": "We explored the ancient ruins together.",
+      "index": 0,
+      "vector": [0.1, 0.2, 0.3, ...],
+      "name": "Ruins Exploration",
+      "importance": 150,
+      "keywords": ["ruins", "adventure"],
+      "disabled": false
+    }
+  ]
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "inserted": 1
+}
+```
+
+### Query Collection
+
+#### `POST /lancedb/query`
+
+Searches collection for similar vectors.
+
+**Request:**
+```json
+{
+  "collectionId": "similharity_chat_Alice",
+  "queryVector": [0.1, 0.2, 0.3, ...],
+  "topK": 10
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "results": [
+    {
+      "hash": "abc123",
+      "text": "We explored the ancient ruins together.",
+      "score": 0.92,
+      "metadata": {
+        "name": "Ruins Exploration",
+        "importance": 150,
+        "keywords": ["ruins", "adventure"]
+      }
+    }
+  ]
+}
+```
+
+### List Saved Hashes
+
+#### `POST /lancedb/list`
+
+Returns all hashes in collection.
+
+**Request:**
+```json
+{
+  "collectionId": "similharity_chat_Alice"
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "hashes": ["abc123", "def456", "ghi789"]
+}
+```
+
+### Delete Vectors
+
+#### `POST /lancedb/delete`
+
+Deletes specific items by hash.
+
+**Request:**
+```json
+{
+  "collectionId": "similharity_chat_Alice",
+  "hashes": ["abc123", "def456"]
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "deleted": 2
+}
+```
+
+### Purge Collection
+
+#### `POST /lancedb/purge`
+
+Deletes entire collection.
+
+**Request:**
+```json
+{
+  "collectionId": "similharity_chat_Alice"
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "Collection similharity_chat_Alice purged"
+}
+```
+
+### Purge All Collections
+
+#### `POST /lancedb/purge-all`
+
+Deletes ALL LanceDB collections. **Use with caution!**
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "All collections purged"
+}
+```
+
+### Get Collection Statistics
+
+#### `GET /lancedb/stats/:collectionId`
+
+Returns statistics for a collection.
+
+**Response:**
+```json
+{
+  "success": true,
+  "stats": {
+    "rowCount": 150,
+    "sizeBytes": 1048576
+  }
+}
+```
+
+---
+
+## Qdrant Backend
+
+**Multitenancy Support:** Qdrant uses a single collection with payload filters to separate data from different sources (chat/character/global).
+
+### Initialize
+
+#### `POST /qdrant/init`
+
+Connects to Qdrant server.
+
+**Request:**
+```json
+{
+  "url": "http://localhost:6333",
+  "apiKey": "your-api-key"
+}
+```
+
+**Alternative (host/port):**
+```json
+{
+  "host": "localhost",
+  "port": 6333,
+  "apiKey": "your-api-key"
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "Qdrant initialized"
+}
+```
+
+### Health Check
+
+#### `GET /qdrant/health`
+
+Checks Qdrant server health.
+
+**Response:**
+```json
+{
+  "healthy": true
+}
+```
+
+### Insert Vectors (Multitenancy)
+
+#### `POST /qdrant/insert`
+
+Inserts vectors with tenant metadata for filtering.
+
+**Request:**
+```json
+{
+  "collectionId": "similharity_global",
+  "items": [
+    {
+      "hash": "abc123",
+      "text": "Ancient lore about dragons",
+      "vector": [0.1, 0.2, 0.3, ...],
+      "importance": 200,
+      "keywords": ["dragon", "lore"]
+    }
+  ],
+  "tenantMetadata": {
+    "type": "chat",
+    "sourceId": "alice_chat_001"
+  }
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "inserted": 1
+}
+```
+
+### Query Collection (Multitenancy)
+
+#### `POST /qdrant/query`
+
+Searches with payload filters for multitenancy.
+
+**Request:**
+```json
+{
+  "collectionId": "similharity_global",
+  "queryVector": [0.1, 0.2, 0.3, ...],
+  "topK": 10,
+  "filters": {
+    "type": "chat",
+    "sourceId": "alice_chat_001",
+    "minImportance": 100
+  }
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "results": [
+    {
+      "hash": "abc123",
+      "text": "Ancient lore about dragons",
+      "score": 0.95,
+      "metadata": {
+        "importance": 200,
+        "keywords": ["dragon", "lore"]
+      }
+    }
+  ]
+}
+```
+
+### List Hashes (Multitenancy)
+
+#### `POST /qdrant/list`
+
+Lists hashes with tenant filters.
+
+**Request:**
+```json
+{
+  "collectionId": "similharity_global",
+  "filters": {
+    "type": "chat",
+    "sourceId": "alice_chat_001"
+  }
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "hashes": ["abc123", "def456"]
+}
+```
+
+### Delete Vectors
+
+#### `POST /qdrant/delete`
+
+Deletes specific items by hash.
+
+**Request:**
+```json
+{
+  "collectionId": "similharity_global",
+  "hashes": ["abc123", "def456"]
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "deleted": 2
+}
+```
+
+### Purge Collection (Multitenancy)
+
+#### `POST /qdrant/purge`
+
+Purges vectors matching tenant filters.
+
+**Request:**
+```json
+{
+  "collectionId": "similharity_global",
+  "filters": {
+    "type": "chat",
+    "sourceId": "alice_chat_001"
+  }
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "Collection similharity_global purged"
+}
+```
+
+### Purge All Collections
+
+#### `POST /qdrant/purge-all`
+
+Deletes ALL Qdrant collections. **Use with extreme caution!**
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "All collections purged"
+}
+```
+
+---
+
+## Vectra (Standard Backend) - Enhanced
+
+**Why Enhanced Vectra?**
+
+SillyTavern's `/api/vector/insert` is hardcoded to only store `{hash, text, index}`. This plugin provides custom endpoints that store **full metadata** for chunk properties like importance, keywords, conditions, etc.
+
+### Insert with Full Metadata
+
+#### `POST /vectra/insert`
+
+Stores ALL chunk metadata fields (not just hash/text/index).
+
+**Request:**
+```json
+{
+  "collectionId": "similharity_chat_Alice",
+  "source": "transformers",
+  "items": [
+    {
+      "hash": "abc123",
+      "text": "We defeated the dragon in the mountains.",
+      "index": 0,
+      "name": "Dragon Battle",
+      "importance": 150,
+      "keywords": ["dragon", "combat", "victory"],
+      "disabled": false,
+      "customWeight": 1.5,
+      "conditions": {
+        "enabled": true,
+        "rules": [
+          { "type": "keyword", "operator": "contains", "value": "dragon" }
+        ]
+      },
+      "chunkGroup": "Combat Scenes",
+      "groupBoost": 1.2,
+      "summaryVectors": ["Epic dragon fight"],
+      "isSummaryChunk": false,
+      "parentHash": null,
+      "metadata": {
+        "timestamp": 1234567890,
+        "messageIndex": 42,
+        "sceneTitle": "Mountain Battle"
+      }
+    }
+  ]
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "inserted": 1
+}
+```
+
+### List with Full Metadata
+
+#### `POST /vectra/list`
+
+Returns ALL items with complete metadata (not just hash/text/index).
+
+**Request:**
+```json
+{
+  "collectionId": "similharity_chat_Alice",
+  "source": "transformers"
+}
+```
+
+**Response:**
+```json
+[
+  {
+    "hash": "abc123",
+    "text": "We defeated the dragon in the mountains.",
+    "index": 0,
+    "vector": [0.1, 0.2, 0.3, ...],
+    "metadata": {
+      "hash": "abc123",
+      "text": "We defeated the dragon in the mountains.",
+      "index": 0,
+      "name": "Dragon Battle",
+      "importance": 150,
+      "keywords": ["dragon", "combat", "victory"],
+      "disabled": false,
+      "customWeight": 1.5,
+      "conditions": {...},
+      "chunkGroup": "Combat Scenes",
+      "groupBoost": 1.2,
+      "summaryVectors": ["Epic dragon fight"],
+      "isSummaryChunk": false,
+      "parentHash": null,
+      "timestamp": 1234567890,
+      "messageIndex": 42,
+      "sceneTitle": "Mountain Battle"
+    }
+  }
+]
+```
+
+### Query with Full Metadata
+
+#### `POST /vectra/query`
+
+Searches and returns results with ALL metadata.
+
+**Request:**
+```json
+{
+  "collectionId": "similharity_chat_Alice",
+  "source": "transformers",
+  "searchText": "dragon battle",
+  "topK": 10,
+  "threshold": 0.5
+}
+```
+
+**Response:**
+```json
+[
+  {
+    "hash": "abc123",
+    "text": "We defeated the dragon in the mountains.",
+    "index": 0,
+    "score": 0.92,
+    "metadata": {
+      "name": "Dragon Battle",
+      "importance": 150,
+      "keywords": ["dragon", "combat", "victory"],
+      ...
+    }
+  }
+]
+```
+
+---
+
+## Embedding Utilities
+
+### Query with Vectors
+
+#### `POST /query-with-vectors`
+
+Returns results **with embedding vectors** (for client-side similarity calculations).
+
+**Request:**
+```json
+{
+  "collectionId": "similharity_chat_Alice",
+  "source": "transformers",
+  "queryVector": [0.1, 0.2, 0.3, ...],
+  "topK": 10,
+  "threshold": 0.5
+}
+```
+
+**Response:**
+```json
+[
+  {
+    "hash": "abc123",
+    "text": "We defeated the dragon in the mountains.",
+    "index": 0,
+    "vector": [0.1, 0.2, 0.3, ...],
+    "score": 0.92
+  }
+]
+```
+
+### List with Vectors
+
+#### `POST /list-with-vectors`
+
+Returns all items **with embedding vectors**.
+
+**Request:**
+```json
+{
+  "collectionId": "similharity_chat_Alice",
+  "source": "transformers"
+}
+```
+
+**Response:**
+```json
+[
+  {
+    "hash": "abc123",
+    "text": "We defeated the dragon in the mountains.",
+    "index": 0,
+    "vector": [0.1, 0.2, 0.3, ...]
+  }
+]
+```
+
+### Get Embedding
+
+#### `POST /get-embedding`
+
+Generates embedding for a single text using configured provider.
+
+**Request:**
+```json
+{
+  "text": "dragon battle in the mountains",
+  "source": "transformers",
+  "model": "Xenova/all-MiniLM-L6-v2"
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "embedding": [0.1, 0.2, 0.3, ...]
+}
+```
+
+### Batch Embeddings
+
+#### `POST /batch-embeddings`
+
+Generates embeddings for multiple texts.
+
+**Request:**
+```json
+{
+  "texts": [
+    "dragon battle",
+    "ancient ruins",
+    "forest encounter"
+  ],
+  "source": "transformers",
+  "model": "Xenova/all-MiniLM-L6-v2"
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "embeddings": [
+    [0.1, 0.2, 0.3, ...],
+    [0.4, 0.5, 0.6, ...],
+    [0.7, 0.8, 0.9, ...]
+  ]
+}
+```
+
+---
+
+## Supported Embedding Sources
+
+The plugin supports all SillyTavern embedding providers:
+
+- `transformers` - Local transformers.js models
+- `openai` - OpenAI embeddings API
+- `togetherai` - Together AI
+- `mistral` - Mistral AI
+- `nomicai` - Nomic AI
+- `cohere` - Cohere embeddings
+- `ollama` - Ollama local embeddings
+- `llamacpp` - llama.cpp server
+- `vllm` - vLLM server
+- `palm` - Google PaLM API
+- `vertexai` - Google Vertex AI
+- `extras` - SillyTavern Extras
+
+---
+
+## Metadata Schema
+
+Similharity stores rich metadata with each vector chunk:
+
+### Core Fields (ST Compatibility)
+- `hash` - Content hash
+- `text` - Chunk text
+- `index` - Chunk index
+
+### Similharity Rich Metadata
+- `name` - Custom chunk name
+- `disabled` - Enable/disable chunk
+- `importance` - Importance weighting (0-200%)
+- `keywords` - Keyword array for boosting
+- `customWeight` - Custom similarity weight multiplier
+
+### Conditional Activation
+- `conditions` - Rules for when chunk should activate
+  - `enabled` - Enable/disable conditions
+  - `rules` - Array of condition rules
+
+### Dual-Vector
+- `summaryVectors` - Summary text embeddings
+- `isSummaryChunk` - Is this a summary chunk?
+- `parentHash` - Parent chunk hash
+
+### Chunk Groups
+- `chunkGroup` - Group name
+- `groupBoost` - Group similarity boost multiplier
+
+### Temporal Data
+- `timestamp` - Unix timestamp
+- `messageIndex` - Message index in chat
+- `sceneIndex` - Scene index
+- `sceneTitle` - Scene title
+
+---
+
+## Error Handling
+
+All endpoints return standard error responses:
+
+```json
+{
+  "success": false,
+  "error": "Error message here"
+}
+```
+
+Or for simple errors:
+
+```json
+{
+  "error": "Error message here"
+}
+```
+
+---
+
+## Security Note
+
+This plugin provides direct access to vector databases. Only install if you trust the Similharity extension. Never expose plugin endpoints to untrusted clients.
+
+---
+
+## License
+
+MIT
+
+## Author
+
+Coneja-Chibi
+
+## Repository
+
+[https://github.com/Conejachibi/VectHare](https://github.com/Conejachibi/VectHare)
+
+
+## Key store
+
+Qdrant API key and Milvus token/password are kept per user in
+`<user>/vectors/vecthare-owned-state/secrets.json` (written atomically, mode 0600 where the
+OS supports it). The browser can only ask whether a name is set (`POST /secrets/status`),
+replace it or remove it (`POST /secrets/set {name, value}`, empty value removes). No route
+returns a value. When Qdrant/Milvus is initialised the stored value is used in place of any
+value in the request, so older extension builds keep working until they migrate.
+
+## Outbound URL guard
+
+Fetches the plugin makes itself (BananaBread and KoboldCpp embeddings, `/rerank`) are
+unrestricted while SillyTavern has a single user. With more than one user, loopback,
+private-network, link-local and non-http(s) targets are refused. The server admin can allow
+them with the environment variable `SIMILHARITY_ALLOW_PRIVATE_URLS=1`. The check is best
+effort (the name is resolved once for the check and again by the fetch).
+
+## Storage report
+
+`POST /storage/report` with `{ "defaults": { "backend", "source", "model", "qdrantMultitenancy" } }`
+(today's VectHare settings, only used to say what today's settings-based rule would pick).
+**Read-only**: it reads the caller's `collections.json` and every backend that is already
+connected on the server, and never creates, changes or deletes anything. For each recorded
+collection it returns the layout (`per-collection`, `legacy-mt`, `legacy-shared`, `conflict`,
+`not-found`, `unknown`), the physical store, the vector count and where the saved original
+settings were found (`found` / `missing` / `multiple` / `invalid` / `unavailable`). It also
+lists the shared stores (for legacy Qdrant multitenancy: vectors per `content_type` and the
+number with none) and VectHare-named physical stores no record points at. On a multi-user
+server (or when the user count cannot be confirmed) other users' names are only shown to an
+admin; everyone else sees counts. `/health` advertises `capabilities.storageReport: 1`.
+
+Deletes in the legacy shared Qdrant store (`vecthare_multitenancy`) are limited to the
+caller's own points (`content_type`); a delete there without that scope is refused (409).
+
+## Storage locators
+
+The extension records, per collection, where its vectors and saved original settings are
+(`collections[id].storage` in `collections.json`). `/storage/report` shows that locator for
+each collection (`locator`, `locatorAgrees`) and counts them in `summary.locators` /
+`summary.locatorDisagrees`. Milvus hybrid queries are answered with 400 at once (no native
+hybrid query for Milvus); callers fall back to vector search.
+
+## Multitenancy v2
+
+`/health` advertises `capabilities.scopedTenancy: 2`. A request that carries
+`storage: { layout, dim?, physical? }` (`layout`: Qdrant `mt-v2`; Milvus `mt-v2` or
+`per-collection`) is scoped by the plugin: the tenant key is
+`<ST user handle>/<type>/<sourceId>` (from `req.user` and the validated collection id, max
+512 characters), client filters are dropped, and the physical store is
+`vecthare_mt_<dim>` (shared, never dropped) or, for Milvus per-collection,
+`vh_<first 24 hex of sha1(tenantKey)>`. Without `dim` the plugin finds the store holding the
+tenant (or creates `vecthare_mt_<dim>` at the first insert, and returns `storage` in the insert
+reply). Qdrant point ids are UUIDv5(tenantKey:hash). Saved original settings are kept in the
+physical store under `vecthare_initial_<sha256(tenantKey)>`; a purge empties that slot with a
+`{vecthareTombstone: 1}` marker. Milvus v2 needs server 2.2.9 or newer.
+
+Legacy multitenancy (`vecthare_multitenancy`): reads are limited to one collection when the
+request names `filters.content_type` explicitly (requests without it are unchanged).
+
+## Move storage and ownership
+
+`POST /storage/move` (Qdrant/Milvus, same server only):
+
+- `{action: 'copy', backend, collectionId, from: {layout, physical, dim?}, to: {layout}, embedding: {source, model}}`
+  copies one collection's vectors to the other layout without re-embedding, verifies the count
+  and 5 random vectors, and returns `{copied, sourceCount, target: {layout, physical, dim}}`. The
+  target must hold nothing for the collection (vectors or live saved settings). Legacy Qdrant
+  multitenancy is refused as a source; neither old shared store is offered as a target. Milvus is
+  limited to 16000 vectors per move. On a failure the partial target is removed.
+- `{action: 'delete-copy', backend, collectionId, location}` deletes one copy (vectors, then its
+  saved settings slot as a tombstone; shared stores are never dropped) and verifies it is empty.
+  Refused (409) for the location VectHare's metadata file records as current.
+
+Saved original settings on Qdrant/Milvus carry `owner` (the ST user handle, set by the plugin).
+On a multi-user server a non-admin user cannot use a per-collection Qdrant store stamped by another
+user, and `/collections` lists per-collection Qdrant stores only to their owner (unstamped: admins).

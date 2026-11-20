@@ -155,6 +155,26 @@ export async function init(router) {
     // empty until someone calls /backend/init. A request that needs one brings
     // back the last working connection (remembered at init, keys from the key
     // store) instead of failing with "not initialized" until the page reloads.
+    // VH-094: once per user (first request after the plugin starts), move
+    // Standard collections that older builds wrote to the folder without a
+    // model into SillyTavern's own folder, before anything reads them through
+    // SillyTavern's /api/vector/* (which only looks there).
+    const vectraScopeScans = new Map();
+    router.use(async (req, res, next) => {
+        const directories = req.user?.directories;
+        const handle = req.user?.profile?.handle || directories?.vectors;
+        if (directories?.vectors && handle) {
+            if (!vectraScopeScans.has(handle)) {
+                vectraScopeScans.set(handle, moveOldVectraScopes(directories).catch((error) => {
+                    vectraScopeScans.delete(handle);
+                    console.warn(`[${pluginName}] Standard collection folder check skipped: ${error?.message || error}`);
+                }));
+            }
+            await vectraScopeScans.get(handle);
+        }
+        next();
+    });
+
     const restoring = new Map();
     const LISTS_EVERY_BACKEND = new Set(['/collections', '/storage/report', '/collections/paths']);
     router.use(async (req, res, next) => {
@@ -699,7 +719,15 @@ export async function init(router) {
                             });
                         }
 
+                        // VH-098: inserting a hash that is already stored replaces it
+                        // (vectra's upsertItem without an id always appended, so every
+                        // retried insert added another copy of the same chunk).
+                        const incoming = new Set(itemsWithVectors.map(item => String(item.hash)));
+                        const replaced = (await store.listItems())
+                            .filter(existing => incoming.has(String(existing.metadata?.hash)))
+                            .map(existing => existing.id);
                         await store.beginUpdate();
+                        for (const id of replaced) await store.deleteItem(id);
                         for (const item of itemsWithVectors) {
                             await store.upsertItem({
                                 vector: item.vector,
@@ -795,6 +823,8 @@ export async function init(router) {
                     },
 
                     purge: async (collectionId, source, model, directories) => {
+                        // VH-094: SillyTavern's folder (moving older plugin data there first).
+                        model = await vectraScopedModel(directories, collectionId, source, model);
                         // Do not create an index to purge it. Vectra deleteIndex()
                         // deletes its whole folder; with no model subfolder that
                         // folder may also contain *other* models' indexes.
@@ -926,7 +956,8 @@ export async function init(router) {
                             }
                         }
 
-                        // Get file size
+                        // Get file size (VH-094: in SillyTavern's folder)
+                        model = await vectraScopedModel(directories, collectionId, source, model);
                         const indexPath = model
                             ? path.join(directories.vectors, sanitize(source), sanitize(collectionId), sanitize(model), 'index.json')
                             : path.join(directories.vectors, sanitize(source), sanitize(collectionId), 'index.json');
@@ -1274,9 +1305,12 @@ export async function init(router) {
             if (backend === 'lancedb') {
                 candidate = path.join(vectorsPath, 'lancedb', safeSource, `${collectionId}.lance`);
             } else {
-                const safeModel = sanitize(String(model || ''));
+                // VH-094: SillyTavern's model folder for this source.
+                const scoped = sanitize(String(collectionId)) === String(collectionId)
+                    ? await vectraScopedModel(req.user.directories, collectionId, safeSource, String(model || '')) : String(model || '');
+                const safeModel = sanitize(scoped);
                 candidate = path.join(vectorsPath, safeSource, collectionId,
-                    ...(model && safeModel === String(model) ? [safeModel] : []));
+                    ...(scoped && safeModel === scoped ? [safeModel] : []));
             }
             return res.json({
                 success: true, remote: false, metadata,
@@ -2000,7 +2034,9 @@ export async function init(router) {
                     folder = path.join(req.user.directories.vectors, 'lancedb', safeSource, `${segment(table)}.lance`);
                 } else {
                     const parts = [req.user.directories.vectors, sanitize(source), sanitize(collectionId)];
-                    if (model) parts.push(sanitize(model));
+                    // VH-094: next to the chunks, in SillyTavern's folder.
+                    const scoped = await vectraScopedModel(req.user.directories, collectionId, source, model);
+                    if (scoped) parts.push(sanitize(scoped));
                     folder = path.join(...parts);
                     // Do not call getIndex here: it creates missing indexes.
                     // Provenance must attach only to a real, written collection.
@@ -2048,7 +2084,8 @@ export async function init(router) {
     // response - is 'unverified' and never reported as absent.
     router.post('/collections/exists', async (req, res) => {
         try {
-            const { backend = 'vectra', collectionId, physicalCollectionId, source, model } = req.body;
+            const { backend = 'vectra', collectionId, physicalCollectionId, source } = req.body;
+            let { model } = req.body;
             // Read-only route: it reports whether a collection exists and
             // creates, changes and deletes nothing, so it is NOT restricted to
             // VectHare-owned identities. The ownership gate belongs on the
@@ -2167,8 +2204,12 @@ export async function init(router) {
 
             // Vectra / Standard: the index directory for the exact recorded
             // provider and model folder. Never create anything here.
+            // VH-094: the model folder is SillyTavern's for this source.
             const safeCollection = sanitize(String(collectionId));
             const safeSource = sanitize(String(source || ''));
+            if (safeSource && safeSource === String(source) && safeCollection && (model || await stVectraModelScope(String(source), ''))) {
+                model = await vectraScopedModel(req.user.directories, collectionId, String(source), model ? String(model) : '');
+            }
             const safeModel = sanitize(String(model || ''));
             if (!safeCollection || !safeSource || safeSource !== String(source) ||
                 (model && safeModel !== String(model))) {
@@ -2307,11 +2348,14 @@ export async function init(router) {
                         });
                 } else {
                     const safeCollection = sanitize(collectionId);
-                    const safeModel = sanitize(model);
-                    if (!safeCollection || (model && !safeModel) ||
+                    if (!safeCollection || (model && !sanitize(model)) ||
                         (source !== '*' && (!source || sanitize(source) !== source))) {
                         return res.status(400).json({ error: 'Invalid collection location' });
                     }
+                    // VH-094: the saved settings sit next to the chunks, in SillyTavern's folder.
+                    const vectraModel = source === '*' ? model
+                        : await vectraScopedModel(req.user.directories, collectionId, source, model);
+                    const safeModel = sanitize(vectraModel);
                     const vectorsRoot = req.user.directories.vectors;
                     const sources = source === '*' ? (await roots(vectorsRoot)).filter(src => src !== 'lancedb')
                         : [source];
@@ -2319,7 +2363,7 @@ export async function init(router) {
                         const safeSource = sanitize(src);
                         if (!safeSource || safeSource !== src) continue;
                         const base = path.join(vectorsRoot, safeSource, safeCollection);
-                        if (model) {
+                        if (vectraModel) {
                             const folder = path.join(base, safeModel);
                             folderSources.set(folder, src);
                             folders.push(folder);
@@ -3878,9 +3922,72 @@ async function _getLegacySingleEmbedding(source, text, model, directories, req, 
 /**
  * Get vectra index for a collection
  */
+/**
+ * VH-094: the model folder SillyTavern itself uses for a Vectra (Standard)
+ * collection - src/endpoints/vectors.js getSourceSettings() -> getModelScope().
+ * VectHare reads Standard collections through SillyTavern's own
+ * /api/vector/list|query|delete, so the plugin must write to the same folder.
+ * It used the model VectHare sent instead: for transformers (SillyTavern takes
+ * the model from config.yaml) and fixed-model sources that was a different
+ * folder, so nothing written through the plugin could be read back.
+ */
+async function stVectraModelScope(source, model) {
+    const m = model ? String(model) : '';
+    switch (source) {
+        case 'transformers': {
+            try {
+                const { getConfigValue } = await import('../../src/util.js');
+                return String(getConfigValue('extensions.models.embedding', '') || '');
+            } catch {
+                return m;
+            }
+        }
+        case 'llamacpp':
+        case 'extras': return '';
+        case 'mistral': return 'mistral-embed';
+        case 'nomicai': return 'nomic-embed-text-v1.5';
+        case 'electronhub': return m || 'text-embedding-3-small';
+        case 'openrouter': return m || 'openai/text-embedding-3-large';
+        case 'palm':
+        case 'vertexai': return m || 'text-embedding-005';
+        case 'chutes': return m || 'chutes-qwen-qwen3-embedding-8b';
+        case 'nanogpt': return m || 'text-embedding-3-small';
+        case 'siliconflow': return m || 'Qwen/Qwen3-Embedding-0.6B';
+        case 'workers_ai': return m || '@cf/baai/bge-m3';
+        default: return m;
+    }
+}
+
+const vectraScopeMoves = new Map();
+
+/**
+ * VH-094: the model folder to use for a Vectra collection - SillyTavern's own
+ * (see stVectraModelScope). Chunks and VectHare's saved-settings file written by
+ * earlier plugin builds under the model VectHare sent are moved there once.
+ * @returns {Promise<string>} the model folder name to use ('' = no subfolder)
+ */
+async function vectraScopedModel(directories, collectionId, source, model) {
+    const scope = await stVectraModelScope(source, model);
+    const raw = model ? String(model) : '';
+    if (sanitize(scope) === sanitize(raw) || !source || !collectionId) return scope;
+    const collectionDir = path.join(directories.vectors, sanitize(source), sanitize(collectionId));
+    const oldPath = raw ? path.join(collectionDir, sanitize(raw)) : collectionDir;
+    const newPath = scope ? path.join(collectionDir, sanitize(scope)) : collectionDir;
+    const key = `${oldPath}\u0000${newPath}`;
+    if (!vectraScopeMoves.has(key)) {
+        vectraScopeMoves.set(key, moveVectraScope(oldPath, newPath).catch((error) => {
+            vectraScopeMoves.delete(key);
+            console.warn(`[similharity] Could not move Standard collection ${collectionId} to SillyTavern's folder:`, error?.message || error);
+        }));
+    }
+    await vectraScopeMoves.get(key);
+    return scope;
+}
+
 async function getIndex(directories, collectionId, source, model) {
-    const pathToFile = model
-        ? path.join(directories.vectors, sanitize(source), sanitize(collectionId), sanitize(model))
+    const scope = await vectraScopedModel(directories, collectionId, source, model);
+    const pathToFile = scope
+        ? path.join(directories.vectors, sanitize(source), sanitize(collectionId), sanitize(scope))
         : path.join(directories.vectors, sanitize(source), sanitize(collectionId));
 
     const store = new vectra.LocalIndex(pathToFile);
@@ -3890,6 +3997,71 @@ async function getIndex(directories, collectionId, source, model) {
     }
 
     return store;
+}
+
+/**
+ * VH-094: scan one user's Vectra folders for VectHare collections whose index
+ * sits in the collection folder itself while SillyTavern reads a model
+ * subfolder for that source, and move them (see vectraScopedModel).
+ */
+async function moveOldVectraScopes(directories) {
+    let sources;
+    try {
+        sources = (await fs.readdir(directories.vectors, { withFileTypes: true }))
+            .filter(entry => entry.isDirectory() && entry.name !== 'lancedb' && !entry.name.startsWith('vecthare-owned'))
+            .map(entry => entry.name);
+    } catch (error) {
+        if (error.code === 'ENOENT') return;
+        throw error;
+    }
+    for (const source of sources) {
+        if (!await stVectraModelScope(source, '')) continue;
+        let collections;
+        try {
+            collections = (await fs.readdir(path.join(directories.vectors, source), { withFileTypes: true }))
+                .filter(entry => entry.isDirectory() && entry.name.startsWith('vecthare_')).map(entry => entry.name);
+        } catch { continue; }
+        for (const collectionId of collections) {
+            try {
+                await fs.access(path.join(directories.vectors, source, collectionId, 'index.json'));
+            } catch { continue; }
+            await vectraScopedModel(directories, collectionId, source, '');
+        }
+    }
+}
+
+/** VH-094: move an index (and VectHare's saved-settings file) from the old plugin folder into SillyTavern's. */
+async function moveVectraScope(oldPath, newPath) {
+    const oldIndex = new vectra.LocalIndex(oldPath);
+    const oldConfig = path.join(oldPath, 'vecthare-initial-config.json');
+    const newConfig = path.join(newPath, 'vecthare-initial-config.json');
+    const exists = async file => { try { return (await fs.stat(file)).isFile(); } catch { return false; } };
+    const oldItems = await oldIndex.isIndexCreated() ? await oldIndex.listItems() : [];
+    const newIndex = new vectra.LocalIndex(newPath);
+    const newItems = await newIndex.isIndexCreated() ? await newIndex.listItems() : [];
+    if (oldItems.length && newItems.length) {
+        console.warn(`[similharity] Standard collection has chunks in both ${oldPath} and ${newPath}; leaving both as they are.`);
+        return;
+    }
+    if (oldItems.length) {
+        if (!await newIndex.isIndexCreated()) await newIndex.createIndex();
+        const seen = new Set();
+        await newIndex.beginUpdate();
+        for (const item of oldItems) {
+            const hash = String(item.metadata?.hash);
+            if (seen.has(hash)) continue;
+            seen.add(hash);
+            await newIndex.upsertItem({ vector: item.vector, metadata: item.metadata });
+        }
+        await newIndex.endUpdate();
+        // Only the old index file goes; the folder may be SillyTavern's own parent folder.
+        await fs.rm(path.join(oldPath, 'index.json'), { force: true });
+        console.log(`[similharity] Moved Standard collection chunks (${seen.size} unique of ${oldItems.length}) into SillyTavern's folder ${newPath}`);
+    }
+    if (await exists(oldConfig) && !await exists(newConfig)) {
+        await fs.mkdir(newPath, { recursive: true });
+        await fs.rename(oldConfig, newConfig);
+    }
 }
 
 /**
