@@ -2705,6 +2705,8 @@ export async function init(router) {
                 case 'milvus':
                     healthy = await milvusBackend.healthCheck();
                     message = healthy ? 'Milvus connected' : 'Milvus not available';
+                    // the server version, read once per connection (shown in VectHare)
+                    if (healthy && !milvusBackend.v2Version) await milvusBackend.assertV2Supported().catch(() => {});
                     break;
 
                 default:
@@ -2712,7 +2714,8 @@ export async function init(router) {
             }
 
             res.json({ backend, healthy, message,
-                ...(backend === 'qdrant' ? { version: qdrantBackend.serverVersion || null, writable: qdrantBackend.supportsCollectionMetadata() !== false } : {}) });
+                ...(backend === 'qdrant' ? { version: qdrantBackend.serverVersion || null, writable: qdrantBackend.supportsCollectionMetadata() !== false } : {}),
+                ...(backend === 'milvus' ? { version: milvusBackend.v2Version?.version ?? null, writable: milvusBackend.v2Version ? milvusBackend.v2Version.ok : null } : {}) });
 
         } catch (error) {
             console.error(`[${pluginName}] backend/health error:`, error);
