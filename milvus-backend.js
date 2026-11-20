@@ -143,6 +143,7 @@ class MilvusBackend {
             this.client = candidate;
             this.config = next;
             this.isConnected = true;
+            this.v2Version = null; // a new connection may be a different server
             if (changed && previous && previous !== candidate) {
                 // idle-release timers belong to the previous server
                 for (const timer of this.v2Idle?.values() || []) clearTimeout(timer);
