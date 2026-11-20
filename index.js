@@ -824,6 +824,8 @@ export async function init(router) {
 
                     purge: async (collectionId, source, model, directories) => {
                         // VH-094: SillyTavern's folder (moving older plugin data there first).
+                        // The saved provenance records the model VectHare asked for.
+                        const requestedModel = model ? String(model) : '';
                         model = await vectraScopedModel(directories, collectionId, source, model);
                         // Do not create an index to purge it. Vectra deleteIndex()
                         // deletes its whole folder; with no model subfolder that
@@ -867,7 +869,7 @@ export async function init(router) {
                             if (config) {
                                 if (config.collectionId !== collectionId ||
                                     config.snapshot?.embedding?.provider !== source ||
-                                    config.snapshot?.embedding?.model !== model) {
+                                    ![model, requestedModel].includes(config.snapshot?.embedding?.model ?? '')) {
                                     throw new Error('Sanitized Vectra model destination is not verified');
                                 }
                             } else {
@@ -1310,7 +1312,7 @@ export async function init(router) {
                     ? await vectraScopedModel(req.user.directories, collectionId, safeSource, String(model || '')) : String(model || '');
                 const safeModel = sanitize(scoped);
                 candidate = path.join(vectorsPath, safeSource, collectionId,
-                    ...(scoped && safeModel === scoped ? [safeModel] : []));
+                    ...(safeModel ? [safeModel] : []));
             }
             return res.json({
                 success: true, remote: false, metadata,
@@ -2208,7 +2210,8 @@ export async function init(router) {
             const safeCollection = sanitize(String(collectionId));
             const safeSource = sanitize(String(source || ''));
             if (safeSource && safeSource === String(source) && safeCollection && (model || await stVectraModelScope(String(source), ''))) {
-                model = await vectraScopedModel(req.user.directories, collectionId, String(source), model ? String(model) : '');
+                // The folder name is the sanitized model (SillyTavern's names can contain "/").
+                model = sanitize(await vectraScopedModel(req.user.directories, collectionId, String(source), model ? String(model) : ''));
             }
             const safeModel = sanitize(String(model || ''));
             if (!safeCollection || !safeSource || safeSource !== String(source) ||
