@@ -1,7 +1,7 @@
 {
   "name": "similharity",
   "version": "4.0.0",
-  "description": "Vector database backend extensions for Similharity - LanceDB, Qdrant, and enhanced Vectra with full metadata storage",
+  "description": "Server plugin for VectHare - Standard (Vectra), LanceDB, Qdrant and Milvus vector storage with full metadata",
   "main": "index.js",
   "type": "module",
   "author": "Coneja-Chibi",
@@ -16,6 +16,7 @@
     "embeddings",
     "lancedb",
     "qdrant",
+    "milvus",
     "vectra",
     "similarity"
   ],
