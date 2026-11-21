@@ -3172,7 +3172,11 @@ async function _getLegacySingleEmbedding(source, text, model, directories, req, 
             const { getLlamaCppVector } = await import('../../src/vectors/llamacpp-vectors.js');
             const apiUrl = req.body?.apiUrl || 'http://localhost:8080';
             await assertOutboundUrlAllowed(req, parseProviderUrl('llama.cpp', apiUrl)); // VH-036
-            return await getLlamaCppVector(text, apiUrl, directories);
+            // SillyTavern after 1.19.1 adds a model argument: (text, apiUrl, model,
+            // directories); 1.19.1 and older take (text, apiUrl, directories).
+            return await llamaCppTakesModel()
+                ? await getLlamaCppVector(text, apiUrl, model ? String(model) : '', directories)
+                : await getLlamaCppVector(text, apiUrl, directories);
         }
         case 'bananabread': {
             // Legacy single-item fallback (should normally be handled by batch handler)
@@ -3948,6 +3952,20 @@ async function _getLegacySingleEmbedding(source, text, model, directories, req, 
  * the model from config.yaml) and fixed-model sources that was a different
  * folder, so nothing written through the plugin could be read back.
  */
+let llamaCppModelArg = null;
+/** Whether this SillyTavern's llama.cpp embedding function takes a model argument. */
+async function llamaCppTakesModel() {
+    if (llamaCppModelArg === null) {
+        try {
+            const { getLlamaCppVector } = await import('../../src/vectors/llamacpp-vectors.js');
+            llamaCppModelArg = typeof getLlamaCppVector === 'function' && getLlamaCppVector.length >= 4;
+        } catch {
+            llamaCppModelArg = false;
+        }
+    }
+    return llamaCppModelArg;
+}
+
 async function stVectraModelScope(source, model) {
     const m = model ? String(model) : '';
     switch (source) {
@@ -3959,7 +3977,9 @@ async function stVectraModelScope(source, model) {
                 return m;
             }
         }
-        case 'llamacpp':
+        // SillyTavern after 1.19.1 keeps a llama.cpp model (when one is given)
+        // as the folder, like other sources; 1.19.1 and older never do.
+        case 'llamacpp': return (await llamaCppTakesModel()) ? m : '';
         case 'extras': return '';
         case 'mistral': return 'mistral-embed';
         case 'nomicai': return 'nomic-embed-text-v1.5';
